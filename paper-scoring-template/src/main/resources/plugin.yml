@@ -1,0 +1,5 @@
+name: UnionScoring
+version: 0.1.0
+main: com.jlucraft.scoring.UnionScoring
+api-version: '26.3'
+description: Game-independent league score reporting API

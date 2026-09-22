@@ -1,0 +1,3 @@
+endpoint: 'http://127.0.0.1:8091'
+league: 'configure-league-id'
+# Set UNION_SCORING_TOKEN in the Paper process environment; never distribute it to clients.

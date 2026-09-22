@@ -1,0 +1,10 @@
+
+/target/
+**/target/
+.local/
+*.key
+*.pem
+**/.gradle/
+**/build/
+**/src/main/jniLibs/
+local.properties
