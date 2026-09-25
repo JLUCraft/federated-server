@@ -1,10 +1,9 @@
 use super::*;
+use hmac::{Hmac, KeyInit, Mac};
+use league::{governance::Rules, journal::Journal};
+use node::{AccessPolicy, NodeConfig, Service, ServiceId};
+use sha2::Sha256;
 use tokio::net::TcpListener;
-use union_core::journal::{Command, Journal, SignedCommand};
-use union_core::{
-    AccessPolicy, NodeConfig, Service, ServiceId,
-    governance::{Rules, State},
-};
 
 async fn paper_connection(
     mut stream: TcpStream,
@@ -37,14 +36,14 @@ async fn paper_connection(
         .find(|p| p.uuid == uuid && p.name == name)
         .ok_or_else(|| anyhow::anyhow!("unexpected backend profile"))?;
     let mut query = vec![];
-    wire::varint(7, &mut query);
+    wire::varint(u32::MAX, &mut query);
     wire::string("velocity:player_info", &mut query)?;
     query.push(4);
     wire::write_packet(&mut stream, Packet { id: 4, body: query }, None).await?;
     let response = Packet::decode(&wire::read_frame(&mut stream).await?, None)?;
     assert_eq!(response.id, 2);
     let mut f = Fields::new(&response.body);
-    assert_eq!(f.int()?, 7);
+    assert_eq!(f.int()?, -1);
     assert_eq!(f.bytes(1)?, [1]);
     let signature = f.bytes(32)?;
     let mut mac = Hmac::<Sha256>::new_from_slice(&secret)?;
@@ -99,8 +98,14 @@ async fn paper_connection(
     let _closed = wire::read_frame(&mut stream).await;
     Ok(())
 }
+async fn proxy_session(address: std::net::SocketAddr, session: IncomingSession) -> Result<()> {
+    let mut remote = TcpStream::connect(address).await?;
+    let mut stream = session.stream.compat();
+    tokio::io::copy_bidirectional(&mut remote, &mut stream).await?;
+    Ok(())
+}
 async fn room_host(
-    gateway: union_core::PeerId,
+    gateway: node::PeerId,
     secret: Vec<u8>,
     profiles: Vec<Profile>,
 ) -> Result<(Node, Backend, tokio::task::JoinHandle<()>)> {
@@ -109,6 +114,7 @@ async fn room_host(
     let mut node = Node::start(Identity::generate(), NodeConfig::default()).await?;
     let id = ServiceId::new();
     node.publish(Service {
+        metadata: Vec::new(),
         id,
         name: "room".into(),
         protocol: "minecraft/java/tcp".into(),
@@ -128,9 +134,17 @@ async fn room_host(
         let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
-             connection=listener.accept()=>{let (stream,_)=connection.unwrap();let (secret,profiles)=(secret.clone(),profiles.clone());tasks.spawn(async move{paper_connection(stream,secret,profiles).await});},
-             session=incoming.recv()=>{let Some(session)=session else {break};tasks.spawn(async move{let mut remote=TcpStream::connect(address).await?;let mut stream=session.stream.compat();tokio::io::copy_bidirectional(&mut remote,&mut stream).await?;Ok(())});},
-             Some(result)=tasks.join_next(),if !tasks.is_empty()=>{result.unwrap().unwrap();}
+                connection = listener.accept() => {
+                    let (stream, _) = connection.unwrap();
+                    tasks.spawn(paper_connection(stream, secret.clone(), profiles.clone()));
+                }
+                session = incoming.recv() => {
+                    let Some(session) = session else { break };
+                    tasks.spawn(proxy_session(address, session));
+                }
+                Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                    result.unwrap().unwrap();
+                }
             }
         }
     });
@@ -196,39 +210,37 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
             Profile {
                 uuid: uuid::Uuid::from_u128(1),
                 name: "Alice".into(),
-                properties: vec![],
             },
             Profile {
                 uuid: uuid::Uuid::from_u128(2),
                 name: "Bob".into(),
-                properties: vec![],
             },
         ];
-        let mut journal = Journal::open(
-            dir.path().join("journal"),
-            State::new([admin.peer_id().to_string()].into())?,
-        )?;
+        let mut identities = crate::test_identity::Identities::new(
+            &[
+                (&admin, "admin", "jlu"),
+                (&users[0], "alice", "jlu"),
+                (&users[1], "bob", "jlu"),
+            ],
+            "admin",
+        );
+        let root = identities.root("jlu");
+        for (i, member) in members.iter().enumerate() {
+            identities.append(
+                node::protocol::TrustAction::BindGameProfile {
+                    club: "jlu".into(),
+                    member: (*member).into(),
+                    profile: profiles[i].uuid.simple().to_string(),
+                },
+                &[&root, &users[i]],
+            );
+        }
+        let mut journal = Journal::open(dir.path().join("journal"), identities.genesis())?;
         let now = now_ms()?;
         for (signer, action) in [
             (
                 &admin,
-                Action::Enroll {
-                    member: "alice".into(),
-                    club: "jlu".into(),
-                    device: users[0].peer_id().to_string(),
-                },
-            ),
-            (
-                &admin,
-                Action::Enroll {
-                    member: "bob".into(),
-                    club: "jlu".into(),
-                    device: users[1].peer_id().to_string(),
-                },
-            ),
-            (
-                &admin,
-                Action::CreateLeague {
+                Action::Domain(league::LeagueAction::CreateLeague {
                     league: "cup".into(),
                     rules: Rules {
                         seats: 1,
@@ -238,57 +250,63 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
                     },
                     host: admin.peer_id().to_string(),
                     scorer: admin.peer_id().to_string(),
-                },
+                }),
             ),
             (
                 &users[0],
-                Action::CreateTeam {
+                Action::Domain(league::LeagueAction::CreateTeam {
                     league: "cup".into(),
                     team: "a".into(),
-                },
+                }),
             ),
             (
                 &users[0],
-                Action::Invite {
+                Action::Domain(league::LeagueAction::Invite {
                     league: "cup".into(),
                     team: "a".into(),
                     member: "bob".into(),
-                },
+                }),
             ),
             (
                 &users[1],
-                Action::Accept {
+                Action::Domain(league::LeagueAction::Accept {
                     league: "cup".into(),
                     team: "a".into(),
-                },
+                }),
             ),
             (
                 &users[0],
-                Action::Register {
+                Action::Domain(league::LeagueAction::Register {
                     league: "cup".into(),
                     team: "a".into(),
-                },
+                }),
             ),
         ] {
-            let signed = SignedCommand::sign(
-                signer,
-                Command {
-                    revision: journal.state().revision,
-                    expires_ms: now + 30000,
-                    action,
-                },
-            )?;
-            journal.execute(signed, now)?;
+            identities.run(&mut journal, signer, now, action)?;
         }
         let journal = Arc::new(Mutex::new(journal));
         let mut gateway = Node::start(admin.clone(), NodeConfig::default()).await?;
         let service = ServiceId::new();
+        identities.service(&admin, &service.to_string(), "alice", "play");
+        let view = identities.log.view(Duration::from_secs(60))?;
+        let authority = Authority::Local {
+            journal: journal.clone(),
+            log: Arc::new(Mutex::new(identities.log)),
+            view: view.clone(),
+        };
         gateway
             .publish(Service {
+                metadata: Vec::new(),
                 id: service,
                 name: "league".into(),
                 protocol: "minecraft/java/26.3".into(),
-                access: AccessPolicy::Peers(users.iter().map(Identity::peer_id).collect()),
+                access: AccessPolicy::Trust {
+                    view,
+                    requirement: node::protocol::TrustRequirement {
+                        clubs: ["jlu".into()].into(),
+                        permission: None,
+                    },
+                },
             })
             .await?;
         let (waiting, mut waiting_config, wt) =
@@ -302,19 +320,13 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
             service: service.to_string(),
             waiting: waiting_config,
             arena: arena_config,
-            players: members
-                .iter()
-                .zip(profiles.iter())
-                .map(|(m, p)| (m.to_string(), p.clone()))
-                .collect(),
-            student_policy: None,
         };
         let incoming = gateway.take_incoming()?;
         let gateway = Arc::new(gateway);
         let native = tokio::spawn(serve(
             config,
             gateway.clone(),
-            journal.clone().into(),
+            authority.clone(),
             admin.clone(),
             incoming,
         ));
@@ -327,7 +339,7 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         }
         let mut bad: Connection = Box::new(
             clients[0]
-                .open_service(gateway.peer_id(), service, None)
+                .open_service(gateway.peer_id(), service)
                 .await?
                 .compat(),
         );
@@ -337,36 +349,36 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         for (client, profile) in clients.iter().zip(&profiles) {
             let mut stream: Connection = Box::new(
                 client
-                    .open_service(gateway.peer_id(), service, None)
+                    .open_service(gateway.peer_id(), service)
                     .await?
                     .compat(),
             );
             login(&mut stream, profile).await?;
             streams.push(stream);
         }
-        let selected = {
-            let mut j = journal.lock().await;
-            assert_eq!(j.state().leagues["cup"].online.len(), 2);
-            let now = now_ms()?;
-            let command = SignedCommand::sign(
+        assert_eq!(
+            journal.lock().await.state().domain.leagues["cup"]
+                .online
+                .len(),
+            2
+        );
+        authority
+            .apply(
                 &admin,
-                Command {
-                    revision: j.state().revision,
-                    expires_ms: now + 30000,
-                    action: Action::Start {
-                        league: "cup".into(),
-                        seed: [0; 32],
-                    },
-                },
-            )?;
-            j.execute(command, now)?;
-            usize::from(j.state().leagues["cup"].seats["a"][0].player == "bob")
-        };
+                Action::Domain(league::LeagueAction::Start {
+                    league: "cup".into(),
+                    seed: [0; 32],
+                }),
+            )
+            .await?;
+        let selected = usize::from(
+            journal.lock().await.state().domain.leagues["cup"].seats["a"][0].player == "bob",
+        );
         let standby = 1 - selected;
         transfer(&mut streams[selected]).await?;
         let mut arena_stream: Connection = Box::new(
             clients[selected]
-                .open_service(gateway.peer_id(), service, None)
+                .open_service(gateway.peer_id(), service)
                 .await?
                 .compat(),
         );
@@ -377,14 +389,14 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         transfer(&mut streams[standby]).await?;
         let mut replacement: Connection = Box::new(
             clients[standby]
-                .open_service(gateway.peer_id(), service, None)
+                .open_service(gateway.peer_id(), service)
                 .await?
                 .compat(),
         );
         login(&mut replacement, &profiles[standby]).await?;
         let mut returned: Connection = Box::new(
             clients[selected]
-                .open_service(gateway.peer_id(), service, None)
+                .open_service(gateway.peer_id(), service)
                 .await?
                 .compat(),
         );
@@ -392,11 +404,11 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         {
             let j = journal.lock().await;
             assert!(matches!(
-                j.state().leagues["cup"].route(members[standby]),
+                j.state().domain.leagues["cup"].route(members[standby]),
                 Route::Match { .. }
             ));
             assert_eq!(
-                j.state().leagues["cup"].route(members[selected]),
+                j.state().domain.leagues["cup"].route(members[selected]),
                 Route::Waiting
             );
         }
@@ -415,4 +427,13 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         Ok::<(), anyhow::Error>(())
     })
     .await?
+}
+
+#[test]
+fn native_configuration_rejects_a_separate_player_roster() {
+    let backend = serde_json::json!({"endpoint":{"transport":"local","address":"127.0.0.1:25565"},"forwarding_secret":"/tmp/unused"});
+    let mut config = serde_json::json!({"league":"cup","service":ServiceId::new().to_string(),"waiting":backend,"arena":backend});
+    assert!(serde_json::from_value::<Config>(config.clone()).is_ok());
+    config["players"] = serde_json::json!({});
+    assert!(serde_json::from_value::<Config>(config).is_err());
 }

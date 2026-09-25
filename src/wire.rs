@@ -4,6 +4,8 @@ use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use std::io::{Read, Write};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub const DEFAULT_MC_PORT: u16 = 25565;
+pub const CONFIGURATION_TRANSFER: i32 = 12;
 pub const VERSION: i32 = 777;
 pub const MAX_FRAME: usize = 2_097_151;
 pub const MAX_PACKET: usize = 8_388_608;
@@ -12,6 +14,13 @@ pub const PLAY_KEEPALIVE: i32 = 45;
 pub const PLAY_KEEPALIVE_REPLY: i32 = 28;
 pub const PLAY_RECONFIGURE: i32 = 120;
 pub const PLAY_RECONFIGURE_ACK: i32 = 16;
+// Login-state IDs from the same official report; clientbound unless noted.
+pub const LOGIN_START: i32 = 0;
+pub const LOGIN_ENCRYPTION_REQUEST: i32 = 1;
+pub const LOGIN_FINISHED: i32 = 2;
+pub const LOGIN_COMPRESSION: i32 = 3;
+pub const LOGIN_CUSTOM_QUERY: i32 = 4;
+pub const LOGIN_COOKIE_REQUEST: i32 = 5;
 
 pub fn varint(mut value: u32, out: &mut Vec<u8>) {
     loop {

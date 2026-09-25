@@ -2,11 +2,16 @@
 //! encrypted union services; neither a proxy server nor an auth plugin is used.
 use crate::wire::{self, Fields, Packet};
 use anyhow::{Result, bail, ensure};
-use hmac::{Hmac, Mac};
+use identity::Identity;
+use league::{
+    authority::Authority,
+    governance::{Action, ConnectionHealth, Phase, Route},
+    journal::now_ms,
+};
+use node::{IncomingSession, Node};
 use serde::Deserialize;
-use sha2::Sha256;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -20,12 +25,11 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-use union_core::{
-    Identity, IncomingSession, Node,
-    authority::Authority,
-    governance::{Action, ConnectionHealth, Phase, Route},
-    journal::now_ms,
-};
+const MAX_NATIVE_SESSIONS: usize = 128;
+/// Recovery-time ceiling reported in `ConnectionHealth`; mirrors the cap league
+/// governance enforces on `reconnect_max_ms` and `recovery_ms` (600_000 ms).
+const MAX_RECOVERY_MS: u128 = 600_000;
+const STATUS_DESCRIPTION: &str = "高校联赛";
 
 pub trait GameStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> GameStream for T {}
@@ -48,28 +52,7 @@ pub struct Backend {
     pub endpoint: Endpoint,
     pub forwarding_secret: PathBuf,
 }
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Property {
-    name: String,
-    value: String,
-    signature: Option<String>,
-}
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Profile {
-    pub uuid: uuid::Uuid,
-    pub name: String,
-    #[serde(default)]
-    pub properties: Vec<Property>,
-}
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StudentPolicy {
-    pub trust: union_core::federation::TrustPolicy,
-    pub minimum: union_core::federation::Circle,
-    pub current_enrollment: bool,
-}
+use crate::forwarding::Profile;
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -77,9 +60,6 @@ pub struct Config {
     pub service: String,
     pub waiting: Backend,
     pub arena: Backend,
-    pub players: BTreeMap<String, Profile>,
-    #[serde(default)]
-    pub student_policy: Option<StudentPolicy>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Room {
@@ -92,7 +72,7 @@ struct Active {
 }
 struct Runtime {
     journal: Authority,
-    cache: RwLock<union_core::governance::State>,
+    cache: RwLock<league::governance::State>,
     identity: Identity,
     config: Config,
     healthy: bool,
@@ -110,7 +90,6 @@ enum Stage {
     Play,
     ReconfigurationAck,
 }
-
 impl Backend {
     async fn connect(&self, node: &Node) -> Result<Connection> {
         match &self.endpoint {
@@ -141,7 +120,7 @@ impl Backend {
                 };
                 target.connect(node).await?;
                 Ok(Box::new(
-                    node.open_service(target.peer, service.parse()?, None)
+                    node.open_service(target.peer, service.parse()?)
                         .await?
                         .compat(),
                 ))
@@ -151,7 +130,12 @@ impl Backend {
     async fn healthy(&self, node: &Node) -> bool {
         timeout(Duration::from_secs(3), async {
             let mut stream = self.connect(node).await?;
-            wire::write_packet(&mut stream, handshake("localhost", 25565, 1)?, None).await?;
+            wire::write_packet(
+                &mut stream,
+                handshake("localhost", wire::DEFAULT_MC_PORT, 1)?,
+                None,
+            )
+            .await?;
             wire::write_packet(
                 &mut stream,
                 Packet {
@@ -176,28 +160,7 @@ impl Backend {
         .is_ok_and(|v| v.is_ok())
     }
     fn forwarding(&self, profile: &Profile) -> Result<Vec<u8>> {
-        let secret = std::fs::read_to_string(&self.forwarding_secret)?;
-        let secret = secret.trim();
-        ensure!((32..=256).contains(&secret.len()), "invalid forwarding key");
-        let mut data = vec![];
-        wire::varint(1, &mut data);
-        wire::string("127.0.0.1", &mut data)?;
-        data.extend(profile.uuid.as_bytes());
-        wire::string(&profile.name, &mut data)?;
-        wire::varint(u32::try_from(profile.properties.len())?, &mut data);
-        for p in &profile.properties {
-            wire::string(&p.name, &mut data)?;
-            wire::string(&p.value, &mut data)?;
-            data.push(u8::from(p.signature.is_some()));
-            if let Some(s) = &p.signature {
-                wire::string(s, &mut data)?;
-            }
-        }
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
-        mac.update(&data);
-        let mut result = mac.finalize().into_bytes().to_vec();
-        result.extend(data);
-        Ok(result)
+        crate::forwarding::encode(&self.forwarding_secret, profile)
     }
 }
 fn handshake(host: &str, port: u16, intention: u32) -> Result<Packet> {
@@ -210,7 +173,10 @@ fn handshake(host: &str, port: u16, intention: u32) -> Result<Packet> {
 }
 async fn action(runtime: &Runtime, action: Action) -> Result<()> {
     runtime.journal.apply(&runtime.identity, action).await?;
-    *runtime.cache.write().await = runtime.journal.state(runtime.identity.peer_id()).await?;
+    *runtime.cache.write().await = runtime
+        .journal
+        .operational_state(runtime.identity.peer_id())
+        .await?;
     Ok(())
 }
 async fn presence(
@@ -220,24 +186,25 @@ async fn presence(
     health: ConnectionHealth,
 ) -> Result<()> {
     if !online
-        && runtime.cache.read().await.leagues[&runtime.config.league].phase == Phase::Finished
+        && runtime.cache.read().await.domain.leagues[&runtime.config.league].phase
+            == Phase::Finished
     {
         return Ok(());
     }
     action(
         runtime,
-        Action::Presence {
+        Action::Domain(league::LeagueAction::Presence {
             league: runtime.config.league.clone(),
             member: member.into(),
             online,
             health,
-        },
+        }),
     )
     .await
 }
 async fn room(runtime: &Runtime, member: &str) -> Result<Room> {
     let journal = runtime.cache.read().await;
-    let league = &journal.leagues[&runtime.config.league];
+    let league = &journal.domain.leagues[&runtime.config.league];
     ensure!(
         league
             .team_of(member)
@@ -278,31 +245,13 @@ async fn monitor(shared: Shared, node: Arc<Node>, changed: watch::Sender<()>) ->
                 let runtime = shared.lock().await;
                 (runtime.journal.clone(), runtime.identity.peer_id())
             };
-            let fresh = authority.state(actor).await?;
+            let fresh = authority.operational_state(actor).await?;
             let mut runtime = shared.lock().await;
-            let changed_members = runtime.cache.read().await.members != fresh.members;
-            if changed_members && runtime.config.student_policy.is_none() {
-                let peers = runtime
-                    .config
-                    .players
-                    .keys()
-                    .filter_map(|id| fresh.members.get(id))
-                    .flat_map(|m| m.devices())
-                    .map(|p| p.parse::<union_core::PeerId>())
-                    .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
-                node.publish(union_core::Service {
-                    id: runtime.config.service.parse()?,
-                    name: "高校联赛".into(),
-                    protocol: "minecraft/java/26.3".into(),
-                    access: union_core::AccessPolicy::Peers(peers),
-                })
-                .await?;
-            }
             *runtime.cache.write().await = fresh;
             let healthy = a && b;
             let (paused, expired) = {
                 let j = runtime.cache.read().await;
-                let l = &j.leagues[&runtime.config.league];
+                let l = &j.domain.leagues[&runtime.config.league];
                 let now = now_ms()?;
                 (
                     l.infrastructure_down,
@@ -316,10 +265,10 @@ async fn monitor(shared: Shared, node: Arc<Node>, changed: watch::Sender<()>) ->
             if paused == healthy {
                 action(
                     &runtime,
-                    Action::Infrastructure {
+                    Action::Domain(league::LeagueAction::Infrastructure {
                         league: runtime.config.league.clone(),
                         healthy,
-                    },
+                    }),
                 )
                 .await?;
             }
@@ -327,15 +276,15 @@ async fn monitor(shared: Shared, node: Arc<Node>, changed: watch::Sender<()>) ->
             if healthy && expired {
                 action(
                     &runtime,
-                    Action::Tick {
+                    Action::Domain(league::LeagueAction::Tick {
                         league: runtime.config.league.clone(),
-                    },
+                    }),
                 )
                 .await?;
             }
             let missing = {
                 let j = runtime.cache.read().await;
-                j.leagues[&runtime.config.league]
+                j.domain.leagues[&runtime.config.league]
                     .online
                     .iter()
                     .filter(|m| !runtime.active.contains_key(*m))
@@ -371,7 +320,12 @@ async fn status<S: GameStream>(stream: &mut S) -> Result<()> {
         request.id == 0 && request.body.is_empty(),
         "invalid status request"
     );
-    let value=serde_json::json!({"version":{"name":"26.3","protocol":wire::VERSION},"players":{"max":256,"online":0},"description":{"text":"高校联赛"}}).to_string();
+    let value = serde_json::json!({
+        "version": {"name": "26.3", "protocol": wire::VERSION},
+        "players": {"max": 256, "online": 0},
+        "description": {"text": STATUS_DESCRIPTION},
+    })
+    .to_string();
     let mut body = vec![];
     wire::string(&value, &mut body)?;
     wire::write_packet(stream, Packet { id: 0, body }, None).await?;
@@ -385,7 +339,11 @@ async fn session(
     node: Arc<Node>,
     mut changed: watch::Receiver<()>,
 ) -> Result<()> {
-    let student = incoming.student.clone();
+    let claims = incoming
+        .claims
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("identity required"))?;
+    let admission: node::protocol::TrustAdmission = serde_json::from_slice(claims)?;
     let peer = incoming.peer.to_string();
     let mut client = incoming.stream.compat();
     let first = timeout(Duration::from_secs(10), wire::read_frame(&mut client)).await??;
@@ -427,25 +385,17 @@ async fn session(
                 .map(|(id, _)| id.clone())
                 .ok_or_else(|| anyhow::anyhow!("unknown device"))?
         };
-        let profile = runtime
-            .config
-            .players
-            .get(&member)
-            .ok_or_else(|| anyhow::anyhow!("missing game profile"))?
-            .clone();
-        if runtime.config.student_policy.is_some() {
-            let proof = student
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("school identity required"))?;
+        let profile = {
             ensure!(
-                proof.game_profile == uuid.simple().to_string(),
-                "school credential does not match Minecraft profile"
+                admission.game_profile.as_deref() == Some(uuid.simple().to_string().as_str()),
+                "verified identity does not match Minecraft profile"
             );
-        }
-        ensure!(
-            profile.uuid == uuid && profile.name == name,
-            "Minecraft profile does not match authenticated device"
-        );
+            crate::forwarding::validate_name(&name)?;
+            Profile {
+                uuid,
+                name: name.clone(),
+            }
+        };
         ensure!(
             !runtime.active.contains_key(&member),
             "member already connected"
@@ -463,7 +413,7 @@ async fn session(
         let recovery_ms = runtime
             .disconnected
             .remove(&member)
-            .map(|t| t.elapsed().as_millis().min(600_000) as u64)
+            .map(|t| t.elapsed().as_millis().min(MAX_RECOVERY_MS) as u64)
             .unwrap_or(0);
         runtime.active.insert(
             member.clone(),
@@ -477,68 +427,163 @@ async fn session(
         );
         (member, id, profile, selected, backend)
     };
-    let result=async {
-  let mut remote=backend.connect(&node).await?;
-  wire::write_packet(&mut remote,handshake("localhost",25565,2)?,None).await?;wire::write_packet(&mut remote,login,None).await?;
-  let (cr,mut cw)=tokio::io::split(client);let (br,mut bw)=tokio::io::split(remote);
-  let (ct,mut cx)=mpsc::channel(1);let (bt,mut bx)=mpsc::channel(1);let mut readers=JoinSet::new();readers.spawn(reader(cr,ct));readers.spawn(reader(br,bt));
-  let mut stage=Stage::Login;let mut compression=None;let mut forwarded=false;let mut keepalive:Option<(Vec<u8>,Instant)>=None;let mut announced=false;let mut started=Instant::now();
-  loop {
-   {
-    let runtime=shared.lock().await;
-    let state=runtime.cache.read().await;
-    ensure!(!state.revoked_devices.contains(&peer)&&state.members.get(&member).is_some_and(|m|m.owns(&peer)),"device authorization revoked");
-   }
-   if stage!=Stage::Play&&started.elapsed()>Duration::from_secs(120){bail!("Minecraft login/configuration timed out");}
-   if matches!(stage,Stage::Play|Stage::Configuration)&&room(&*shared.lock().await,&member).await?!=selected {
-    // Fence the old connection before issuing transfer; a reconnect may race
-    // this task's final cleanup, which is guarded by the session generation.
-    finish(&shared,&member,id).await?;
-    let mut body=vec![];wire::string("127.0.0.1",&mut body)?;wire::varint(u32::from(port),&mut body);
-    wire::write_packet(&mut cw,Packet{id:if stage==Stage::Play {wire::PLAY_TRANSFER}else{12},body},compression).await?;return Ok(());
-   }
-   tokio::select! {
-    update=changed.changed()=>{update?;},
-    raw=cx.recv()=>{
-     let raw=raw.ok_or_else(||anyhow::anyhow!("client closed"))??;let p=Packet::decode(&raw,compression)?;
-     match stage {
-      Stage::Login=>ensure!(p.id==4,"unexpected packet before login success"),
-      Stage::LoginAck=>{ensure!(p.id==3&&p.body.is_empty(),"expected login acknowledgment");stage=Stage::Configuration;},
-      Stage::Configuration=>ensure!(p.id!=3,"unsolicited configuration acknowledgment"),
-      Stage::ConfigurationAck if p.id==3=>{
-       ensure!(p.body.is_empty(),"invalid configuration acknowledgment");stage=Stage::Play;
-       if !announced {let runtime=shared.lock().await;let health=runtime.active[&member].health.clone();presence(&runtime,&member,true,health).await?;announced=true;}
-      },
-      Stage::ReconfigurationAck if p.id==wire::PLAY_RECONFIGURE_ACK=>{ensure!(p.body.is_empty(),"invalid reconfiguration acknowledgment");stage=Stage::Configuration;},
-      _=>{},
-     }
-     if stage==Stage::Play&&p.id==wire::PLAY_KEEPALIVE_REPLY && let Some((expected,sent))=keepalive.take(){ensure!(p.body==expected,"unexpected keepalive reply");let rtt=sent.elapsed().as_millis().min(60_000) as u64;let mut runtime=shared.lock().await;if let Some(active)=runtime.active.get_mut(&member){active.health.jitter_ms=(active.health.jitter_ms*3+active.health.rtt_ms.abs_diff(rtt))/4;active.health.rtt_ms=rtt;}
-     }
-     wire::write_frame(&mut bw,&raw).await?;
-    },
-    raw=bx.recv()=>{
-     let raw=raw.ok_or_else(||anyhow::anyhow!("backend closed"))??;let p=Packet::decode(&raw,compression)?;
-     match stage {
-      Stage::Login=>match p.id {
-       1=>bail!("backend encryption requested: configure Paper built-in forwarding"),
-       3=>{let mut f=Fields::new(&p.body);let threshold=usize::try_from(f.int()?)?;f.finish()?;ensure!(threshold<=wire::MAX_PACKET&&compression.is_none(),"invalid compression negotiation");wire::write_frame(&mut cw,&raw).await?;compression=Some(threshold);continue;},
-       4=>{let mut f=Fields::new(&p.body);let transaction=f.int()?;ensure!(transaction>=0&&f.text(128)?=="velocity:player_info"&&!forwarded,"unsupported backend login query");ensure!(f.remaining()==[4],"unsupported forwarding version");let mut body=vec![];wire::varint(transaction as u32,&mut body);body.push(1);body.extend(backend.forwarding(&profile)?);wire::write_packet(&mut bw,Packet{id:2,body},compression).await?;forwarded=true;continue;},
-       2=>{ensure!(forwarded,"backend did not verify identity forwarding");let mut f=Fields::new(&p.body);ensure!(f.bytes(16)?==profile.uuid.as_bytes()&&f.text(16)?==profile.name,"backend profile mismatch");stage=Stage::LoginAck;},
-       0|5=>{},
-       _=>bail!("unexpected backend login packet"),
-      },
-      Stage::Configuration if p.id==3=>{ensure!(p.body.is_empty(),"invalid finish configuration");stage=Stage::ConfigurationAck;},
-      Stage::Play if p.id==wire::PLAY_RECONFIGURE=>{ensure!(p.body.is_empty(),"invalid start configuration");stage=Stage::ReconfigurationAck;started=Instant::now();},
-      Stage::Play if p.id==wire::PLAY_KEEPALIVE=>{ensure!(p.body.len()==8,"invalid keepalive");keepalive=Some((p.body.clone(),Instant::now()));},
-      Stage::Play if p.id==wire::PLAY_TRANSFER=>bail!("backend attempted unmanaged transfer"),
-      Stage::Configuration if p.id==12=>bail!("backend attempted unmanaged transfer"),
-      _=>{},
-     }
-     wire::write_frame(&mut cw,&raw).await?;
+    tracing::info!(member = %member, device = %peer, profile = %profile.uuid, display_name = %profile.name, "verified game identity forwarding");
+    let result = async {
+        let mut remote = backend.connect(&node).await?;
+        wire::write_packet(
+            &mut remote,
+            handshake("localhost", wire::DEFAULT_MC_PORT, 2)?,
+            None,
+        )
+        .await?;
+        wire::write_packet(&mut remote, login, None).await?;
+        let (cr, mut cw) = tokio::io::split(client);
+        let (br, mut bw) = tokio::io::split(remote);
+        let (ct, mut cx) = mpsc::channel(1);
+        let (bt, mut bx) = mpsc::channel(1);
+        let mut readers = JoinSet::new();
+        readers.spawn(reader(cr, ct));
+        readers.spawn(reader(br, bt));
+        let mut stage = Stage::Login;
+        let mut compression = None;
+        let mut negotiation = crate::forwarding::LoginNegotiation::default();
+        let mut keepalive: Option<(Vec<u8>, Instant)> = None;
+        let mut announced = false;
+        let mut started = Instant::now();
+        loop {
+            {
+                let runtime = shared.lock().await;
+                let state = runtime.cache.read().await;
+                ensure!(
+                    state.members.get(&member).is_some_and(|m| m.owns(&peer)),
+                    "device authorization revoked"
+                );
+            }
+            if stage != Stage::Play && started.elapsed() > Duration::from_secs(120) {
+                bail!("Minecraft login/configuration timed out");
+            }
+            if matches!(stage, Stage::Play | Stage::Configuration)
+                && room(&*shared.lock().await, &member).await? != selected
+            {
+                // Fence the old connection before issuing transfer; a reconnect may race
+                // this task's final cleanup, which is guarded by the session generation.
+                finish(&shared, &member, id).await?;
+                let mut body = vec![];
+                wire::string("127.0.0.1", &mut body)?;
+                wire::varint(u32::from(port), &mut body);
+                wire::write_packet(
+                    &mut cw,
+                    Packet {
+                        id: if stage == Stage::Play {
+                            wire::PLAY_TRANSFER
+                        } else {
+                            wire::CONFIGURATION_TRANSFER
+                        },
+                        body,
+                    },
+                    compression,
+                )
+                .await?;
+                return Ok(());
+            }
+            let (from_client, raw) = tokio::select! {
+                update = changed.changed() => { update?; continue; },
+                raw = cx.recv() => (true, raw),
+                raw = bx.recv() => (false, raw),
+            };
+            if from_client {
+                let raw = raw.ok_or_else(|| anyhow::anyhow!("client closed"))??;
+                let p = Packet::decode(&raw, compression)?;
+                match stage {
+                    Stage::Login => ensure!(p.id == 4, "unexpected packet before login success"),
+                    Stage::LoginAck => {
+                        ensure!(
+                            p.id == 3 && p.body.is_empty(),
+                            "expected login acknowledgment"
+                        );
+                        stage = Stage::Configuration;
+                    }
+                    Stage::Configuration => {
+                        ensure!(p.id != 3, "unsolicited configuration acknowledgment")
+                    }
+                    Stage::ConfigurationAck if p.id == 3 => {
+                        ensure!(p.body.is_empty(), "invalid configuration acknowledgment");
+                        stage = Stage::Play;
+                        if !announced {
+                            let runtime = shared.lock().await;
+                            let health = runtime.active[&member].health.clone();
+                            presence(&runtime, &member, true, health).await?;
+                            announced = true;
+                        }
+                    }
+                    Stage::ReconfigurationAck if p.id == wire::PLAY_RECONFIGURE_ACK => {
+                        ensure!(p.body.is_empty(), "invalid reconfiguration acknowledgment");
+                        stage = Stage::Configuration;
+                    }
+                    _ => {}
+                }
+                if stage == Stage::Play
+                    && p.id == wire::PLAY_KEEPALIVE_REPLY
+                    && let Some((expected, sent)) = keepalive.take()
+                {
+                    ensure!(p.body == expected, "unexpected keepalive reply");
+                    let rtt = sent.elapsed().as_millis().min(60_000) as u64;
+                    let mut runtime = shared.lock().await;
+                    if let Some(active) = runtime.active.get_mut(&member) {
+                        active.health.jitter_ms =
+                            (active.health.jitter_ms * 3 + active.health.rtt_ms.abs_diff(rtt)) / 4;
+                        active.health.rtt_ms = rtt;
+                    }
+                }
+                wire::write_frame(&mut bw, &raw).await?;
+            } else {
+                let raw = raw.ok_or_else(|| anyhow::anyhow!("backend closed"))??;
+                let p = Packet::decode(&raw, compression)?;
+                match stage {
+                    Stage::Login => {
+                        use crate::forwarding::LoginStep;
+                        match negotiation
+                            .receive(&p, compression, &profile, || backend.forwarding(&profile))?
+                        {
+                            LoginStep::Compression(threshold) => {
+                                wire::write_frame(&mut cw, &raw).await?;
+                                compression = Some(threshold);
+                                continue;
+                            }
+                            LoginStep::Reply(reply) => {
+                                wire::write_packet(&mut bw, reply, compression).await?;
+                                continue;
+                            }
+                            LoginStep::Ready => stage = Stage::LoginAck,
+                            LoginStep::Forward => {}
+                        }
+                    }
+                    Stage::Configuration if p.id == 3 => {
+                        ensure!(p.body.is_empty(), "invalid finish configuration");
+                        stage = Stage::ConfigurationAck;
+                    }
+                    Stage::Play if p.id == wire::PLAY_RECONFIGURE => {
+                        ensure!(p.body.is_empty(), "invalid start configuration");
+                        stage = Stage::ReconfigurationAck;
+                        started = Instant::now();
+                    }
+                    Stage::Play if p.id == wire::PLAY_KEEPALIVE => {
+                        ensure!(p.body.len() == 8, "invalid keepalive");
+                        keepalive = Some((p.body.clone(), Instant::now()));
+                    }
+                    Stage::Play if p.id == wire::PLAY_TRANSFER => {
+                        bail!("backend attempted unmanaged transfer")
+                    }
+                    Stage::Configuration if p.id == wire::CONFIGURATION_TRANSFER => {
+                        bail!("backend attempted unmanaged transfer")
+                    }
+                    _ => {}
+                }
+                wire::write_frame(&mut cw, &raw).await?;
+            }
+        }
     }
-   }
-  }
- }.await;
+    .await;
     finish(&shared, &member, id).await?;
     result
 }
@@ -549,28 +594,10 @@ pub async fn serve(
     identity: Identity,
     mut incoming: mpsc::Receiver<IncomingSession>,
 ) -> Result<()> {
-    ensure!(
-        !config.players.is_empty() && config.players.len() <= 4096,
-        "invalid player roster"
-    );
-    let mut names = BTreeSet::new();
-    let mut uuids = BTreeSet::new();
-    for p in config.players.values() {
-        ensure!(
-            !p.name.is_empty()
-                && p.name.len() <= 16
-                && p.name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                && names.insert(p.name.to_ascii_lowercase())
-                && uuids.insert(p.uuid)
-                && p.properties.len() <= 8,
-            "invalid or duplicate profile"
-        );
-    }
     {
-        let j = journal.state(identity.peer_id()).await?;
+        let j = journal.operational_state(identity.peer_id()).await?;
         let league = j
+            .domain
             .leagues
             .get(&config.league)
             .ok_or_else(|| anyhow::anyhow!("league missing"))?;
@@ -579,7 +606,7 @@ pub async fn serve(
             "not league host"
         );
     }
-    let cached = journal.state(identity.peer_id()).await?;
+    let cached = journal.operational_state(identity.peer_id()).await?;
     let runtime = Runtime {
         cache: RwLock::new(cached),
         journal,
@@ -592,13 +619,13 @@ pub async fn serve(
     };
     action(
         &runtime,
-        Action::Infrastructure {
+        Action::Domain(league::LeagueAction::Infrastructure {
             league: runtime.config.league.clone(),
             healthy: false,
-        },
+        }),
     )
     .await?;
-    let online = runtime.cache.read().await.leagues[&runtime.config.league]
+    let online = runtime.cache.read().await.domain.leagues[&runtime.config.league]
         .online
         .clone();
     for member in online {
@@ -612,13 +639,24 @@ pub async fn serve(
     loop {
         tokio::select! {
          result=&mut monitor=>{result?;break;},
-         incoming=incoming.recv()=>{let Some(incoming)=incoming else {break};if sessions.len()>=128{continue;}let(shared,node,changed)=(shared.clone(),node.clone(),receiver.clone());sessions.spawn(async move{session(incoming,shared,node,changed).await});},
+         incoming = incoming.recv() => {
+             let Some(incoming) = incoming else { break };
+             if sessions.len() >= MAX_NATIVE_SESSIONS {
+                 tracing::warn!(peer = %incoming.peer, service = %incoming.service, "game session capacity reached; closing stream");
+                 let mut stream = tokio_util::compat::FuturesAsyncReadCompatExt::compat(incoming.stream);
+                 if let Err(error) = tokio::io::AsyncWriteExt::shutdown(&mut stream).await {
+                     tracing::debug!(%error, "game overload close failed");
+                 }
+                 continue;
+             }
+             let (shared, node, changed) = (shared.clone(), node.clone(), receiver.clone());
+             sessions.spawn(async move { session(incoming, shared, node, changed).await });
+         },
          Some(result)=sessions.join_next(),if !sessions.is_empty()=>{match result{Ok(Ok(()))=>{},Ok(Err(error))=>tracing::debug!("game session ended: {error}"),Err(error)=>return Err(error.into())}}
         }
     }
     sessions.shutdown().await;
     Ok(())
 }
-
 #[cfg(test)]
 mod tests;
