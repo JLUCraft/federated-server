@@ -1,6 +1,11 @@
 mod gateway;
 mod trust;
-use std::{fs::OpenOptions, io::Write, net::SocketAddr, path::PathBuf};
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -245,8 +250,15 @@ enum OfficeCommand {
         action: Option<PathBuf>,
     },
 }
-fn write_document(out: PathBuf, value: &impl serde::Serialize) -> Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(out)?;
+pub(crate) fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
     file.write_all(&serde_json::to_vec_pretty(value)?)?;
     file.sync_all()?;
     Ok(())
@@ -385,7 +397,7 @@ async fn main() -> Result<()> {
                 let state =
                     state::State::<Office>::new(serde_json::from_slice(&std::fs::read(binding)?)?)?;
                 let hash = client::protocol::digest(&serde_json::to_vec(&state)?);
-                write_document(out, &state)?;
+                write_json(&out, &state)?;
                 println!("{hash}");
             }
             OfficeCommand::Request {

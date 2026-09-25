@@ -137,16 +137,6 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     );
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
-fn write<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.sync_all()?;
-    Ok(())
-}
 pub async fn execute(command: Command) -> Result<()> {
     match command {
         Command::Template => println!(
@@ -181,12 +171,12 @@ pub async fn execute(command: Command) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(cache.open()?.state())?)
         }
         Command::Draft { cache, action, out } => {
-            write(&out, &cache.open()?.state().draft(read(&action)?))?
+            crate::write_json(&out, &cache.open()?.state().draft(read(&action)?))?
         }
         Command::Sign { key, record, out } => {
             let mut record: TrustRecord = read(&record)?;
             client::trust::sign(&mut record, &node::Identity::load(key)?)?;
-            write(&out, &record)?;
+            crate::write_json(&out, &record)?;
         }
         Command::Sync { cache, target } => remote(cache, target, None).await?,
         Command::Submit {
@@ -201,15 +191,15 @@ pub async fn execute(command: Command) -> Result<()> {
         } => {
             let binding = read(&binding)?;
             match domain.as_str() {
-                "office" => write(
+                "office" => crate::write_json(
                     &out,
                     &state::State::<flows::Flows<events::EventsDomain>>::new(binding)?,
                 )?,
                 "league" => {
-                    write(&out, &state::State::<league::LeagueDomain>::new(binding)?)?
+                    crate::write_json(&out, &state::State::<league::LeagueDomain>::new(binding)?)?
                 }
                 "identity" => {
-                    write(&out, &state::State::<state::EmptyDomain>::new(binding)?)?
+                    crate::write_json(&out, &state::State::<state::EmptyDomain>::new(binding)?)?
                 }
                 _ => anyhow::bail!("unknown business domain"),
             }

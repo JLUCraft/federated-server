@@ -23,20 +23,6 @@ pub enum Command {
         digest: String,
     },
 }
-fn write_new(path: PathBuf, value: &impl serde::Serialize) -> Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.sync_all()?;
-    Ok(())
-}
 pub fn execute(command: Command) -> Result<()> {
     match command {
         Command::Audit {
@@ -50,8 +36,8 @@ pub fn execute(command: Command) -> Result<()> {
                 id: format!("llm-{}-{}", summary.entries, summary.head),
                 digest: digest.clone(),
             };
-            write_new(out, &summary)?;
-            write_new(action, &anchor)?;
+            crate::write_json(&out, &summary)?;
+            crate::write_json(&action, &anchor)?;
             println!("{digest}");
             Ok(())
         }
