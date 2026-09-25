@@ -1,5 +1,5 @@
 [package]
-name = "game-server"
+name = "federated-server"
 version = "0.2.0"
 edition = "2024"
 authors = ["JLUCraft"]
@@ -9,16 +9,24 @@ repository = "https://github.com/JLUCraft/game-server"
 publish = false
 
 [dependencies]
+state = { path = "../union-core/crates/state" }
+client = { path = "../union-core/crates/client", features = ["office"] }
+events = { path = "../union-core/crates/events", features = ["documents"] }
+flows = { path = "../union-core/crates/flows" }
+llm-gateway = { path = "../union-core/crates/llm-gateway" }
 flate2 = "1"
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 uuid = { version = "1", features = ["serde"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 serde_json = "1"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 subtle = "2"
-union-core = { path = "../union-core", features = ["consensus"] }
+league = { path = "../union-core/crates/league", features = ["runtime"] }
+authority = { path = "../union-core/crates/authority" }
+node = { path = "../union-core/crates/node" }
+identity = { path = "../union-core/crates/identity" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -30,6 +38,18 @@ minecraftd = { path = "../minecraftd" }
 unsafe_code = "forbid"
 
 [workspace]
+resolver = "2"
+members = ["tools/unionctl"]
+default-members = [".", "tools/unionctl"]
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = ["server"]
+server = ["league/consensus"]
+
+[[bin]]
+name = "federated-server"
+path = "src/main.rs"
+required-features = ["server"]

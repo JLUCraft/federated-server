@@ -5,19 +5,17 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::post,
 };
+use identity::Identity;
+use league::governance::{Action, Phase};
 use serde::Deserialize;
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 use subtle::ConstantTimeEq;
 #[cfg(test)]
 use tokio::sync::Mutex;
-use union_core::{
-    Identity,
-    governance::{Action, Phase},
-};
 
 #[derive(Clone)]
 struct Context {
-    journal: union_core::authority::Authority,
+    journal: league::authority::Authority,
     identity: Identity,
     token: Arc<Vec<u8>>,
 }
@@ -57,8 +55,12 @@ async fn apply(
         .state(context.identity.peer_id())
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    if let Action::Finish { league } = &action {
-        let league = journal.leagues.get(league).ok_or(StatusCode::NOT_FOUND)?;
+    if let Action::Domain(league::LeagueAction::Finish { league }) = &action {
+        let league = journal
+            .domain
+            .leagues
+            .get(league)
+            .ok_or(StatusCode::NOT_FOUND)?;
         if league.scorer != context.identity.peer_id().to_string() {
             return Err(StatusCode::FORBIDDEN);
         }
@@ -75,7 +77,7 @@ async fn apply(
 }
 pub async fn serve(
     address: SocketAddr,
-    journal: union_core::authority::Authority,
+    journal: league::authority::Authority,
     identity: Identity,
     token: String,
 ) -> anyhow::Result<()> {
@@ -100,12 +102,12 @@ pub async fn serve(
                     apply(
                         c,
                         h,
-                        Action::Score {
+                        Action::Domain(league::LeagueAction::Score {
                             league: s.league,
                             event: s.event,
                             players: s.players,
                             teams: s.teams,
-                        },
+                        }),
                     )
                     .await
                 },
@@ -115,7 +117,12 @@ pub async fn serve(
             "/v1/finish",
             post(
                 |State(c): State<Context>, h: HeaderMap, Json(s): Json<Finish>| async move {
-                    apply(c, h, Action::Finish { league: s.league }).await
+                    apply(
+                        c,
+                        h,
+                        Action::Domain(league::LeagueAction::Finish { league: s.league }),
+                    )
+                    .await
                 },
             ),
         )
@@ -128,42 +135,40 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use union_core::journal::{Command, Journal, SignedCommand, now_ms};
+    use league::journal::{Journal, now_ms};
     #[tokio::test]
     async fn scoring_only_identity_and_bearer_cannot_manage_the_league() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let admin = Identity::generate();
         let scorer = Identity::generate();
-        let mut journal = Journal::open(
-            directory.path().join("journal"),
-            union_core::governance::State::new([admin.peer_id().to_string()].into())?,
-        )?;
+        let ids = crate::test_identity::Identities::new(
+            &[(&admin, "admin", "jlu"), (&scorer, "scorer", "jlu")],
+            "admin",
+        );
+        let view = ids.log.view(std::time::Duration::from_secs(60))?;
+        let mut journal = Journal::open(directory.path().join("journal"), ids.genesis())?;
         let now = now_ms()?;
         for action in [
-            Action::CreateLeague {
+            Action::Domain(league::LeagueAction::CreateLeague {
                 league: "cup".into(),
                 rules: Default::default(),
                 host: admin.peer_id().to_string(),
                 scorer: scorer.peer_id().to_string(),
-            },
-            Action::Start {
+            }),
+            Action::Domain(league::LeagueAction::Start {
                 league: "cup".into(),
                 seed: [0; 32],
-            },
+            }),
         ] {
-            let command = SignedCommand::sign(
-                &admin,
-                Command {
-                    revision: journal.state().revision,
-                    expires_ms: now + 30_000,
-                    action,
-                },
-            )?;
-            journal.execute(command, now)?;
+            ids.run(&mut journal, &admin, now, action)?;
         }
         let journal = Arc::new(Mutex::new(journal));
         let context = Context {
-            journal: journal.clone().into(),
+            journal: league::authority::Authority::Local {
+                journal: journal.clone(),
+                log: Arc::new(Mutex::new(ids.log)),
+                view,
+            },
             identity: scorer,
             token: Arc::new(b"test-scoring-token-with-32-characters".to_vec()),
         };
@@ -172,9 +177,9 @@ mod tests {
             apply(
                 context.clone(),
                 headers.clone(),
-                Action::Finish {
+                Action::Domain(league::LeagueAction::Finish {
                     league: "cup".into()
-                }
+                })
             )
             .await,
             Err(StatusCode::UNAUTHORIZED)
@@ -187,10 +192,9 @@ mod tests {
             apply(
                 context.clone(),
                 headers.clone(),
-                Action::Enroll {
-                    member: "intruder".into(),
-                    club: "jlu".into(),
-                    device: admin.peer_id().to_string()
+                Action::SetMemberRoles {
+                    member: "scorer".into(),
+                    roles: ["admin".into()].into()
                 }
             )
             .await,
@@ -201,9 +205,9 @@ mod tests {
             apply(
                 context.clone(),
                 headers.clone(),
-                Action::Finish {
+                Action::Domain(league::LeagueAction::Finish {
                     league: "cup".into()
-                }
+                })
             )
             .await,
             Ok(StatusCode::NO_CONTENT)
@@ -212,9 +216,9 @@ mod tests {
             apply(
                 context,
                 headers,
-                Action::Finish {
+                Action::Domain(league::LeagueAction::Finish {
                     league: "cup".into()
-                }
+                })
             )
             .await,
             Ok(StatusCode::NO_CONTENT)
