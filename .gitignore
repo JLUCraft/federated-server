@@ -8,3 +8,4 @@
 **/build/
 **/src/main/jniLibs/
 local.properties
+__pycache__/

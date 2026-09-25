@@ -1,0 +1,29 @@
+[package]
+name = "unionctl"
+version = "0.2.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+league = { path = "../../../union-core/crates/league" }
+llm-gateway = { path = "../../../union-core/crates/llm-gateway" }
+identity = { path = "../../../union-core/crates/identity" }
+state = { path = "../../../union-core/crates/state" }
+events = { path = "../../../union-core/crates/events", features = ["documents"] }
+flows = { path = "../../../union-core/crates/flows" }
+serde_json = "1"
+serde = "1"
+node = { path = "../../../union-core/crates/node" }
+client = { path = "../../../union-core/crates/client", features = ["league", "office"] }
+authority = { path = "../../../union-core/crates/authority" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
+terminal-runtime = { path = "../../../union-core/crates/terminal-runtime" }
+minecraftd = { path = "../../../minecraftd" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dev-dependencies]
+tempfile = "3"
