@@ -1,15 +1,14 @@
-//! Local Paper adapter: the plugin receives a scoring-only bearer, never an admin key.
+//! Game-independent local adapter API: the plugin receives a scoring-only bearer, never an admin key.
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
-    routing::post,
+    routing::{get, post},
 };
 use identity::Identity;
 use league::governance::{Action, Phase};
 use serde::Deserialize;
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
-use subtle::ConstantTimeEq;
 #[cfg(test)]
 use tokio::sync::Mutex;
 
@@ -33,16 +32,7 @@ struct Finish {
     league: String,
 }
 fn authorize(headers: &HeaderMap, context: &Context) -> Result<(), StatusCode> {
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    if token.as_bytes().ct_eq(context.token.as_slice()).into() {
-        Ok(())
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
+    crate::bearer::require_bearer(headers, &context.token)
 }
 async fn apply(
     context: Context,
@@ -75,6 +65,43 @@ async fn apply(
         .map_err(|_| StatusCode::CONFLICT)?;
     Ok(StatusCode::NO_CONTENT)
 }
+async fn session(
+    State(context): State<Context>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&headers, &context)?;
+    let state = context
+        .journal
+        .state(context.identity.peer_id())
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let league = state.domain.leagues.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    if league.scorer != context.identity.peer_id().to_string() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let identity = context
+        .journal
+        .identity_view()
+        .state()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let players = league
+        .teams
+        .values()
+        .filter(|team| team.registered)
+        .flat_map(|team| team.members.iter())
+        .filter(|member| {
+            league
+                .admitted
+                .as_ref()
+                .is_none_or(|admitted| admitted.contains(*member))
+        })
+        .map(|member| (member.clone(), identity.profile(member).map(str::to_owned)))
+        .collect::<BTreeMap<_, _>>();
+    Ok(Json(
+        serde_json::json!({"protocol_version":node::protocol::GAME_ADAPTER_VERSION,"league":id,"phase":league.phase,"rules":league.rules,"teams":league.teams,"admitted":league.admitted,"profiles":players,"seats":league.seats}),
+    ))
+}
 pub async fn serve(
     address: SocketAddr,
     journal: league::authority::Authority,
@@ -95,6 +122,7 @@ pub async fn serve(
         token: Arc::new(token.into_bytes()),
     };
     let router = Router::new()
+        .route("/v1/session/{id}", get(session))
         .route(
             "/v1/score",
             post(

@@ -660,3 +660,62 @@ pub async fn serve(
 }
 #[cfg(test)]
 mod tests;
+
+/// A scheduled host serves exactly one playing league for its device. Ambiguous
+/// assignments close the route instead of choosing a league arbitrarily.
+pub async fn serve_scheduled(
+    config: Config,
+    node: Arc<Node>,
+    journal: Authority,
+    identity: Identity,
+    mut incoming: mpsc::Receiver<IncomingSession>,
+) -> Result<()> {
+    if config.league != "auto" {
+        return serve(config, node, journal, identity, incoming).await;
+    }
+    let mut updates = journal.watch().await;
+    let mut tasks = JoinSet::new();
+    let mut selected = String::new();
+    let mut route = None::<mpsc::Sender<IncomingSession>>;
+    loop {
+        updates.borrow_and_update();
+        let state = journal.operational_state(identity.peer_id()).await?;
+        let matches: Vec<_> = state
+            .domain
+            .leagues
+            .iter()
+            .filter(|(_, l)| l.phase == Phase::Playing && l.host == identity.peer_id().to_string())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let candidate = if matches.len() == 1 {
+            matches[0].clone()
+        } else {
+            String::new()
+        };
+        if candidate != selected || (tasks.is_empty() && !candidate.is_empty()) {
+            tasks.shutdown().await;
+            route = None;
+            selected = candidate;
+            if !selected.is_empty() {
+                let mut current = config.clone();
+                current.league = selected.clone();
+                let (send, receive) = mpsc::channel(MAX_NATIVE_SESSIONS);
+                route = Some(send);
+                tasks.spawn(serve(
+                    current,
+                    node.clone(),
+                    journal.clone(),
+                    identity.clone(),
+                    receive,
+                ));
+            }
+        }
+        tokio::select! {
+            changed=updates.changed()=>{changed?;},
+            session=incoming.recv()=>{let Some(session)=session else {break;};if let Some(route)=&route {let _=route.try_send(session);}},
+            result=tasks.join_next(),if !tasks.is_empty()=>{if !matches!(result,Some(Ok(Ok(())))) {tracing::warn!("scheduled game host stopped");}route=None;},
+        }
+    }
+    tasks.shutdown().await;
+    Ok(())
+}

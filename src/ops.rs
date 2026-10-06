@@ -77,6 +77,8 @@ impl Fleet {
         let id = match &request.op {
             OpsOp::Status { instance }
             | OpsOp::Start { instance }
+            | OpsOp::StartLeague { instance, .. }
+            | OpsOp::StopLeague { instance, .. }
             | OpsOp::Stop { instance }
             | OpsOp::Restart { instance }
             | OpsOp::Kill { instance }
@@ -88,13 +90,64 @@ impl Fleet {
             .operation
             .try_lock()
             .context("instance operation already in progress")?;
+        if let OpsOp::StartLeague { league, .. } | OpsOp::StopLeague { league, .. } = &request.op {
+            node::protocol::validate_identifier(league)?;
+            let marker = managed
+                .config
+                .directory
+                .join(node::protocol::GAME_SESSION_FILE);
+            let existing = std::fs::read(&marker).ok().and_then(|bytes| {
+                serde_json::from_slice::<node::protocol::GameSession>(&bytes).ok()
+            });
+            let binding = node::protocol::GameSession {
+                protocol_version: node::protocol::GAME_ADAPTER_VERSION,
+                league: league.clone(),
+            };
+            if matches!(&request.op, OpsOp::StartLeague { .. }) {
+                if matches!(
+                    managed.instance.state(),
+                    InstanceState::Stopped | InstanceState::Error(_)
+                ) {
+                    let directory = marker.parent().context("instance directory missing")?;
+                    std::fs::create_dir_all(directory)?;
+                    let pending = marker.with_extension("pending");
+                    std::fs::write(&pending, serde_json::to_vec(&binding)?)?;
+                    std::fs::rename(pending, &marker)?;
+                } else {
+                    ensure!(
+                        existing.as_ref() == Some(&binding),
+                        "instance belongs to another activity"
+                    );
+                    return Ok(OpsResponse {
+                        ok: true,
+                        instances: vec![status(managed).await?],
+                        ..Default::default()
+                    });
+                }
+            } else {
+                ensure!(
+                    existing.as_ref() == Some(&binding),
+                    "instance belongs to another activity"
+                );
+                if matches!(
+                    managed.instance.state(),
+                    InstanceState::Stopped | InstanceState::Error(_)
+                ) {
+                    return Ok(OpsResponse {
+                        ok: true,
+                        instances: vec![status(managed).await?],
+                        ..Default::default()
+                    });
+                }
+            }
+        }
         let mut response = OpsResponse {
             ok: true,
             ..Default::default()
         };
         let mut states = managed.instance.state_watch();
         let expected = match request.op {
-            OpsOp::Start { .. } => {
+            OpsOp::Start { .. } | OpsOp::StartLeague { .. } => {
                 ensure!(
                     matches!(
                         managed.instance.state(),
@@ -105,7 +158,7 @@ impl Fleet {
                 managed.instance.start().await?;
                 Some(InstanceState::Running)
             }
-            OpsOp::Stop { .. } => {
+            OpsOp::Stop { .. } | OpsOp::StopLeague { .. } => {
                 ensure!(
                     managed.instance.state() == InstanceState::Running,
                     "instance is not running"

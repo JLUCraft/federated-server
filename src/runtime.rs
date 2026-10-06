@@ -638,7 +638,7 @@ impl Host {
                 })
                 .await?;
             let incoming = self.route(id);
-            self.tasks.spawn(crate::native::serve(
+            self.tasks.spawn(crate::native::serve_scheduled(
                 proxy.config,
                 self.node()?,
                 authority.clone(),

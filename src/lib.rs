@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 //! Shared embedded and standalone Minecraft room runtime.
+mod bearer;
 pub mod forwarding;
 pub mod native;
 pub mod ops;
