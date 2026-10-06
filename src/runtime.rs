@@ -243,7 +243,9 @@ impl Config {
         if !self.node.listen.is_empty() {
             network.listen = addresses(&self.node.listen)?;
         }
-        addresses(&self.node.reserve)?;
+        // Validate reserve relay addresses early so `Config::validate` catches
+        // unparseable entries before `start_inner` reparses them for dialing.
+        addresses(&self.node.reserve).context("invalid reserve relay address")?;
         Ok(network)
     }
     fn validate_inner(&self) -> Result<()> {
