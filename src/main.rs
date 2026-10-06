@@ -1,3 +1,4 @@
+mod audit;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use terminal_runtime::init_logging;
@@ -80,6 +81,11 @@ enum Command {
         config: std::path::PathBuf,
         #[arg(long)]
         init: bool,
+    },
+    /// Export or independently verify a local gateway ledger commitment.
+    Gateway {
+        #[command(subcommand)]
+        command: audit::Command,
     },
     /// Start configured services on one shared node.
     Run {
@@ -170,6 +176,7 @@ async fn main() -> Result<()> {
                 serde_json::json!({"genesis":genesis,"genesis_hash":pin})
             );
         }
+        Command::Gateway { command } => audit::execute(command)?,
         Command::IdentityBridge { config, init } => {
             let genesis = federated_server::bootstrap::genesis()?;
             let config = federated_server::identity_bridge::Config::load(&config)?;

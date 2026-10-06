@@ -20,7 +20,7 @@ import uuid
 
 BASE = Path(__file__).resolve().parents[3]
 CORE = BASE / 'federated-server/target/debug'
-SERVER = BASE / 'federated-server/target/debug/federated-server'
+SERVER = CORE / 'examples/acceptance-driver'
 ASSETS = Path(os.environ['ROOMS_ACCEPTANCE_STATE']).resolve()
 PINNED_ASSETS = {
     'paper-1.20.4-496.jar': '9c6419c3504db84d437d4bbeb5b9d27d548a009a3ed2f1c617b62e7341cfeee3',
@@ -86,19 +86,19 @@ def stop(process):
 
 
 try:
-    env = os.environ | {'ROOMS_ACCEPTANCE_STATE': str(STATE), 'UNIONCTL': str(CORE / 'unionctl'),
+    env = os.environ | {'ROOMS_ACCEPTANCE_STATE': str(STATE), 'ACCEPTANCE_DRIVER': str(CORE / 'examples/acceptance-driver'),
                        'NODE_OPTIONS': '--max-old-space-size=512'}
     schools_process = spawn([BASE / 'federated-skinstation/node_modules/.bin/tsx',
                               BASE / 'federated-skinstation/test/fixtures/rooms-schools.ts'], 'schools', env=env)
     until(lambda: (STATE / 'schools.json').exists(), process=schools_process)
     schools = json.loads((STATE / 'schools.json').read_text())
     stop(schools_process)
-    founders = [json.loads(run([CORE / 'unionctl', 'trust', 'founder', '--member', school['school'] + '-chair',
+    founders = [json.loads(run([CORE / 'examples/acceptance-driver', 'trust', 'founder', '--member', school['school'] + '-chair',
         '--club', school['school'], '--peer', school['identities']['root']])) for school in schools]
     genesis = STATE / 'identity-genesis.json'
     genesis.write_text(json.dumps({'federation': 'rooms-acceptance', 'founders': founders, 'quorum': 2}))
-    identity_pin = run([CORE / 'unionctl', 'trust', 'digest', '--genesis', genesis])
-    relay_peer = run([CORE / 'unionctl', 'keygen', '--out', STATE / 'relay.key'])
+    identity_pin = run([CORE / 'examples/acceptance-driver', 'trust', 'digest', '--genesis', genesis])
+    relay_peer = run([CORE / 'examples/acceptance-driver', 'keygen', '--out', STATE / 'relay.key'])
     relay_port = port()
     relay_base = f'/ip4/127.0.0.1/tcp/{relay_port}'
     relay_address = relay_base + '/p2p/' + relay_peer
@@ -114,16 +114,16 @@ try:
         global sequence
         sequence += 1
         target = ['--key', keys[0], '--address', relay_address, '--peer', relay_peer]
-        run([CORE / 'unionctl', 'trust', 'sync', *cache_args, *target])
+        run([CORE / 'examples/acceptance-driver', 'trust', 'sync', *cache_args, *target])
         action_path = STATE / f'action-{sequence}.json'
         action_path.write_text(json.dumps(action))
         record = STATE / f'draft-{sequence}.json'
-        run([CORE / 'unionctl', 'trust', 'draft', *cache_args, '--action', action_path, '--out', record])
+        run([CORE / 'examples/acceptance-driver', 'trust', 'draft', *cache_args, '--action', action_path, '--out', record])
         for index, key in enumerate(keys):
             signed = STATE / f'signed-{sequence}-{index}.json'
-            run([CORE / 'unionctl', 'trust', 'sign', '--key', key, '--record', record, '--out', signed])
+            run([CORE / 'examples/acceptance-driver', 'trust', 'sign', '--key', key, '--record', record, '--out', signed])
             record = signed
-        run([CORE / 'unionctl', 'trust', 'submit', *cache_args, *target, '--record', record])
+        run([CORE / 'examples/acceptance-driver', 'trust', 'submit', *cache_args, *target, '--record', record])
     for school in schools:
         path = Path(school['path'])
         member = school['school'] + '-member'
@@ -174,8 +174,8 @@ try:
         print(school['school'] + ': real Paper room published', flush=True)
     # A separate discovery client must find both hosts via the seed/provider index.
     discover_key = STATE / 'discovery.key'
-    run([CORE / 'unionctl', 'keygen', '--out', discover_key])
-    discovered = json.loads(run([CORE / 'unionctl', 'rooms', '--key', discover_key, '--bootstrap', relay_address]))
+    run([CORE / 'examples/acceptance-driver', 'keygen', '--out', discover_key])
+    discovered = json.loads(run([CORE / 'examples/acceptance-driver', 'rooms', '--key', discover_key, '--bootstrap', relay_address]))
     if {room['service'] for room in discovered['rooms']} != {host['service'] for host in hosts}:
         raise AssertionError('cross-school room discovery incomplete')
     spec = importlib.util.spec_from_file_location('minecraft_login', Path(__file__).with_name('minecraft_login.py'))
@@ -188,7 +188,7 @@ try:
         proxy_port = port()
         # Only the circuit route is supplied: this verifies relay fallback, not LAN direct dialing.
         circuit = relay_address + '/p2p-circuit/p2p/' + other['peer']
-        proxy = spawn([CORE / 'unionctl', 'proxy', '--key', path / 'player.key', '--peer', other['peer'],
+        proxy = spawn([CORE / 'examples/acceptance-driver', 'proxy', '--key', path / 'player.key', '--peer', other['peer'],
                        '--address', circuit, '--service', other['service'],
                        '--bind', f'127.0.0.1:{proxy_port}'], 'proxy-' + str(index))
         until(lambda: 'local game proxy ready' in (STATE / ('proxy-' + str(index) + '.log')).read_text(), process=proxy)

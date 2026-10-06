@@ -1,12 +1,11 @@
 use llm_gateway::Ledger;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn audit_cli_anchors_to_an_independent_governance_authority()
+async fn server_audit_anchors_to_an_independent_governance_authority()
 -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use identity::Identity;
     use league::{governance::State, journal::Journal};
     use node::{Node, NodeConfig};
     use std::{process::Command, sync::Arc};
-    let cli = env!("CARGO_BIN_EXE_unionctl");
     let dir = tempfile::tempdir()?;
     let key = dir.path().join("admin.key");
     let admin = Identity::generate();
@@ -105,7 +104,7 @@ async fn audit_cli_anchors_to_an_independent_governance_authority()
     };
     let summary = dir.path().join("summary.json");
     let action = dir.path().join("action.json");
-    let export = Command::new(env!("CARGO_BIN_EXE_unionctl"))
+    let export = Command::new(env!("CARGO_BIN_EXE_federated-server"))
         .args(["gateway", "audit", "--ledger"])
         .arg(dir.path().join("ledger"))
         .arg("--out")
@@ -119,36 +118,26 @@ async fn audit_cli_anchors_to_an_independent_governance_authority()
         String::from_utf8_lossy(&export.stderr)
     );
     let action_value: serde_json::Value = serde_json::from_slice(&std::fs::read(&action)?)?;
-    let commit = Command::new(cli)
-        .args(["governance", "--identity-config"])
-        .arg(&config)
-        .arg("--key")
-        .arg(&key)
-        .args([
-            "--address",
-            &server.addresses()[0].to_string(),
-            "--peer",
-            &server.peer_id().to_string(),
-            "--genesis-hash",
-            &pin,
-            "--revision",
-            "0",
-            "--action",
-        ])
-        .arg(&action)
-        .output()?;
-    assert!(
-        commit.status.success(),
-        "{}",
-        String::from_utf8_lossy(&commit.stderr)
-    );
-    let committed: serde_json::Value = serde_json::from_slice(&commit.stdout)?;
+    let committed = client::generic::execute::<league::LeagueDomain>(
+        admin.clone(),
+        client::generic::Input {
+            identity: serde_json::from_slice(&std::fs::read(&config)?)?,
+            address: server.addresses()[0].to_string(),
+            peer: server.peer_id().to_string(),
+            genesis_hash: pin,
+            revision: Some(0),
+            action: Some(serde_json::from_value(action_value.clone())?),
+        },
+    )
+    .await?;
+    assert!(committed.error.is_none());
+    let committed = serde_json::to_value(committed)?;
     let id = action_value["id"].as_str().ok_or("missing anchor id")?;
     let digest = committed["state"]["digest_anchors"][id]["digest"]
         .as_str()
         .ok_or("missing anchor")?;
     let verify = |digest: &str| {
-        Command::new(env!("CARGO_BIN_EXE_unionctl"))
+        Command::new(env!("CARGO_BIN_EXE_federated-server"))
             .args(["gateway", "verify-audit", "--ledger"])
             .arg(dir.path().join("ledger"))
             .arg("--summary")

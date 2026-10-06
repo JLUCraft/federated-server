@@ -36,8 +36,8 @@ pub fn execute(command: Command) -> Result<()> {
                 id: format!("llm-{}-{}", summary.entries, summary.head),
                 digest: digest.clone(),
             };
-            crate::write_json(&out, &summary)?;
-            crate::write_json(&action, &anchor)?;
+            federated_server::bootstrap::write_new(&out, &summary)?;
+            federated_server::bootstrap::write_new(&action, &anchor)?;
             println!("{digest}");
             Ok(())
         }

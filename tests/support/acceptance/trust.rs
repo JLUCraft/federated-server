@@ -52,8 +52,6 @@ impl Target {
 }
 #[derive(Subcommand)]
 pub enum Command {
-    /// Print an explicitly incomplete genesis template; replace every placeholder.
-    Template,
     /// Export a founder record from an Ed25519 device PeerId (no private key required).
     Founder {
         #[arg(long)]
@@ -107,28 +105,6 @@ pub enum Command {
         #[arg(long)]
         record: PathBuf,
     },
-    /// Create a new business genesis using unified identities and explicit service permissions.
-    BusinessGenesis {
-        #[arg(long)]
-        binding: PathBuf,
-        #[arg(long)]
-        domain: String,
-        #[arg(long)]
-        out: PathBuf,
-    },
-    /// Submit a business action with verified identity history (office or league).
-    Business {
-        #[command(flatten)]
-        cache: Cache,
-        #[command(flatten)]
-        target: Target,
-        #[arg(long)]
-        business_genesis: String,
-        #[arg(long)]
-        domain: String,
-        #[arg(long)]
-        action: PathBuf,
-    },
 }
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     ensure!(
@@ -139,14 +115,6 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 }
 pub async fn execute(command: Command) -> Result<()> {
     match command {
-        Command::Template => println!(
-            "{}",
-            serde_json::to_string_pretty(&TrustGenesis {
-                federation: "REPLACE_WITH_STABLE_FEDERATION_ID".into(),
-                founders: vec![wire_founder()],
-                quorum: 1
-            })?
-        ),
         Command::Founder { member, club, peer } => {
             let peer: node::PeerId = peer.parse()?;
             let public_key = identity::PublicKey::try_decode_protobuf(peer.as_ref().digest())
@@ -184,82 +152,8 @@ pub async fn execute(command: Command) -> Result<()> {
             target,
             record,
         } => remote(cache, target, Some(read(&record)?)).await?,
-        Command::BusinessGenesis {
-            binding,
-            domain,
-            out,
-        } => {
-            let binding = read(&binding)?;
-            match domain.as_str() {
-                "office" => crate::write_json(
-                    &out,
-                    &state::State::<flows::Flows<events::EventsDomain>>::new(binding)?,
-                )?,
-                "league" => {
-                    crate::write_json(&out, &state::State::<league::LeagueDomain>::new(binding)?)?
-                }
-                "identity" => {
-                    crate::write_json(&out, &state::State::<state::EmptyDomain>::new(binding)?)?
-                }
-                _ => anyhow::bail!("unknown business domain"),
-            }
-        }
-        Command::Business {
-            cache,
-            target,
-            business_genesis,
-            domain,
-            action,
-        } => {
-            let identity = node::Identity::load(&target.key)?;
-            let log = cache.open()?;
-            let node = target.node().await?;
-            let result = async {
-                match domain.as_str() {
-                    "office" => Ok(serde_json::to_value(
-                        client::trust::execute::<flows::Flows<events::EventsDomain>>(
-                            &node,
-                            target.peer.parse()?,
-                            &business_genesis,
-                            &identity,
-                            &log,
-                            read(&action)?,
-                        )
-                        .await?,
-                    )?),
-                    "league" => Ok(serde_json::to_value(
-                        client::trust::execute::<league::LeagueDomain>(
-                            &node,
-                            target.peer.parse()?,
-                            &business_genesis,
-                            &identity,
-                            &log,
-                            read(&action)?,
-                        )
-                        .await?,
-                    )?),
-                    _ => Err(anyhow::anyhow!("unknown business domain")),
-                }
-            }
-            .await;
-            node.shutdown().await?;
-            let response = result?;
-            println!("{}", serde_json::to_string_pretty(&response)?);
-            ensure!(
-                response["error"].is_null(),
-                "business request rejected: {}",
-                response["error"]
-            );
-        }
     }
     Ok(())
-}
-fn wire_founder() -> client::protocol::TrustFounder {
-    client::protocol::TrustFounder {
-        member: "REPLACE_WITH_STABLE_MEMBER_ID".into(),
-        club: "REPLACE_WITH_CLUB_ID".into(),
-        public_key: vec![],
-    }
 }
 async fn remote(cache: Cache, target: Target, record: Option<TrustRecord>) -> Result<()> {
     let log = tokio::sync::Mutex::new(cache.open()?);

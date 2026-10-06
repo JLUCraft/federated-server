@@ -57,3 +57,9 @@ server = ["league/consensus"]
 name = "federated-server"
 path = "src/main.rs"
 required-features = ["server"]
+
+# Explicitly built acceptance fixture, never installed as a production terminal.
+[[example]]
+name = "acceptance-driver"
+path = "tests/support/acceptance/main.rs"
+required-features = ["server"]
