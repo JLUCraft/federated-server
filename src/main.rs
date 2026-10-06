@@ -74,6 +74,13 @@ enum Command {
     },
     /// Export the compiled public identity genesis and its digest.
     Genesis,
+    /// Run the skin site's authenticated loopback identity adapter.
+    IdentityBridge {
+        #[arg(long)]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        init: bool,
+    },
     /// Start configured services on one shared node.
     Run {
         #[arg(long)]
@@ -162,6 +169,29 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::json!({"genesis":genesis,"genesis_hash":pin})
             );
+        }
+        Command::IdentityBridge { config, init } => {
+            let genesis = federated_server::bootstrap::genesis()?;
+            let config = federated_server::identity_bridge::Config::load(&config)?;
+            if init {
+                println!(
+                    "{}",
+                    federated_server::identity_bridge::initialize(&config)?
+                );
+            } else {
+                let listener = tokio::net::TcpListener::bind(config.bind).await?;
+                let router = federated_server::identity_bridge::router(config, genesis)?;
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        #[cfg(unix)]
+                        if let Ok(mut terminate) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                            tokio::select! { _ = terminate.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+                            return;
+                        }
+                        let _ = tokio::signal::ctrl_c().await;
+                    })
+                    .await?;
+            }
         }
         Command::Check { config } => {
             federated_server::bootstrap::load(&config)?;
