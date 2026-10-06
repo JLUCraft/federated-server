@@ -16,6 +16,7 @@ fn operation_error(error: anyhow::Error) -> Error {
     }
 }
 
+pub mod bootstrap;
 mod office_ai;
 pub mod runtime;
 

@@ -74,8 +74,12 @@ pub struct Scoring {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityService {
+    #[serde(default)]
     pub genesis: PathBuf,
+    #[serde(default)]
     pub genesis_hash: String,
+    #[serde(skip)]
+    embedded_genesis: Option<node::protocol::TrustGenesis>,
     pub log: PathBuf,
     pub writer: bool,
     pub source: Option<IdentitySource>,
@@ -102,6 +106,8 @@ pub struct Governance {
     pub domain: Domain,
     pub genesis: PathBuf,
     pub journal: PathBuf,
+    #[serde(default)]
+    pub binding: Option<node::protocol::TrustBusinessBinding>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -153,7 +159,18 @@ impl Config {
         let mut config: Self = read(&path)?;
         relative(base, &mut config.node.key);
         if let Some(identity) = &mut config.services.identity {
-            relative(base, &mut identity.genesis);
+            if identity.genesis.as_os_str().is_empty() {
+                let genesis = crate::bootstrap::genesis()?;
+                let pin = client::trust::TrustState::genesis_digest(&genesis)?;
+                ensure!(
+                    identity.genesis_hash.is_empty() || identity.genesis_hash == pin,
+                    "identity genesis does not match this server build"
+                );
+                identity.genesis_hash = pin;
+                identity.embedded_genesis = Some(genesis);
+            } else {
+                relative(base, &mut identity.genesis);
+            }
             relative(base, &mut identity.log);
         }
         if let Some(proxy) = &mut config.services.league_proxy {
@@ -455,7 +472,10 @@ impl Host {
     }
     async fn prepare(&mut self, mut services: Services) -> Result<()> {
         if let Some(config) = services.identity.take() {
-            let genesis: node::protocol::TrustGenesis = read(&config.genesis)?;
+            let genesis = match config.embedded_genesis {
+                Some(genesis) => genesis,
+                None => read(&config.genesis)?,
+            };
             let log = Arc::new(Mutex::new(authority::trust::TrustLog::open(
                 &config.log,
                 &genesis,

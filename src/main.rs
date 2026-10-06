@@ -10,6 +10,70 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Download and verify a document using this operator node's authorized identity.
+    FetchDocument {
+        #[arg(long)]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        address: String,
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        service: String,
+        #[arg(long)]
+        hash: String,
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Import local content into the configured document collection by its verified digest.
+    ImportDocument {
+        #[arg(long)]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+    /// Export an existing executor's public identity; never exports the private key.
+    DevicePublic {
+        #[arg(long)]
+        key: std::path::PathBuf,
+    },
+    /// Prove this executor owns the device named in a manager-signed binding record.
+    SignDevice {
+        #[arg(long)]
+        key: std::path::PathBuf,
+        #[arg(long)]
+        record: std::path::PathBuf,
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Export verified identity settings for import into manager or launcher.
+    IdentityConfig {
+        #[arg(long)]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        address: Option<String>,
+    },
+    /// Create a new server-side executor device without overwriting a key.
+    InitDevice {
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Initialize the node key and optional business genesis, without replacing files.
+    Init {
+        #[arg(long)]
+        config: std::path::PathBuf,
+    },
+    /// Co-sign this host's service registration drafted and signed by a chair.
+    SignService {
+        #[arg(long)]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        record: std::path::PathBuf,
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Export the compiled public identity genesis and its digest.
+    Genesis,
     /// Start configured services on one shared node.
     Run {
         #[arg(long)]
@@ -25,12 +89,86 @@ enum Command {
 async fn main() -> Result<()> {
     init_logging();
     match Args::parse().command {
+        Command::FetchDocument {
+            config,
+            address,
+            peer,
+            service,
+            hash,
+            out,
+        } => {
+            let config = federated_server::bootstrap::load(&config)?;
+            let bytes = client::documents::fetch(
+                identity::Identity::load(&config.node.key)?,
+                client::documents::Input {
+                    address,
+                    peer,
+                    service,
+                    hash,
+                },
+            )
+            .await?;
+            federated_server::bootstrap::write_new_bytes(&out, &bytes)?;
+        }
+        Command::ImportDocument { config, file } => {
+            let config = federated_server::bootstrap::load(&config)?;
+            let documents = config
+                .services
+                .documents
+                .ok_or_else(|| anyhow::anyhow!("document service is not configured"))?;
+            println!("{}", events::documents::store(&documents.directory, &file)?);
+        }
+        Command::DevicePublic { key } => println!(
+            "{}",
+            serde_json::to_string_pretty(&client::management::PublicIdentity::from_identity(
+                &identity::Identity::load(key)?
+            ))?
+        ),
+        Command::SignDevice { key, record, out } => {
+            federated_server::bootstrap::sign_device(&key, &record, &out)?
+        }
+        Command::IdentityConfig { config, address } => {
+            let config = federated_server::bootstrap::load(&config)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&federated_server::bootstrap::identity_config(
+                    &config, address
+                )?)?
+            );
+        }
+        Command::InitDevice { out } => println!(
+            "{}",
+            serde_json::to_string_pretty(&federated_server::bootstrap::initialize_device(&out)?)?
+        ),
+        Command::Init { config } => {
+            let config = federated_server::bootstrap::load(&config)?;
+            println!("{}", federated_server::bootstrap::initialize(&config)?);
+        }
+        Command::SignService {
+            config,
+            record,
+            out,
+        } => {
+            federated_server::bootstrap::sign_service(
+                &federated_server::bootstrap::load(&config)?,
+                &record,
+                &out,
+            )?;
+        }
+        Command::Genesis => {
+            let genesis = federated_server::bootstrap::genesis()?;
+            let pin = client::trust::TrustState::genesis_digest(&genesis)?;
+            println!(
+                "{}",
+                serde_json::json!({"genesis":genesis,"genesis_hash":pin})
+            );
+        }
         Command::Check { config } => {
-            federated_server::runtime::Config::load(&config)?;
+            federated_server::bootstrap::load(&config)?;
             println!("configuration valid");
         }
         Command::Run { config } => {
-            let config = federated_server::runtime::Config::load(&config)?;
+            let config = federated_server::bootstrap::load(&config)?;
             let mut host = federated_server::runtime::Host::start(config).await?;
             println!("{}", serde_json::to_string(&host.status()?)?);
             #[cfg(unix)]

@@ -248,3 +248,91 @@ fn setup_identity(
         },
     ))
 }
+
+#[tokio::test]
+async fn document_terminal_download_checks_hash_and_live_read_permission() -> Result {
+    use node::protocol::{TrustAction, TrustRequest};
+    let dir = tempfile::tempdir()?;
+    let host_key = Identity::generate();
+    let admin = Identity::generate();
+    let reader = Identity::generate();
+    host_key.save_new(dir.path().join("node.key"))?;
+    let documents = ServiceId::new();
+    let (identity_config, mut cache, _) = setup_identity(
+        dir.path(),
+        &admin,
+        &host_key,
+        Some((&reader, ServiceId::new(), documents)),
+    )?;
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, b"verified terminal document")?;
+    let collection = dir.path().join("documents");
+    let hash = events::documents::store(&collection, &source)?;
+    let path = dir.path().join("node.json");
+    write(
+        &path,
+        &json!({"node":{"key":"node.key"},"services":{"identity":identity_config,"documents":{"service":documents.to_string(),"directory":"documents"}}}),
+    )?;
+    let host = Host::start(Config::load(&path)?).await?;
+    let status = host.status()?;
+    let input = || client::documents::Input {
+        address: status.addresses[0].clone(),
+        peer: status.peer.clone(),
+        service: documents.to_string(),
+        hash: hash.clone(),
+    };
+    // Existing manage permission is intentionally insufficient for a document read.
+    assert!(
+        client::documents::fetch(reader.clone(), input())
+            .await
+            .is_err()
+    );
+    let node = Node::start(admin.clone(), NodeConfig::default()).await?;
+    node.dial(status.addresses[0].parse()?).await?;
+    let mut grant = cache.state().draft(TrustAction::GrantPermission {
+        id: "doc-read".into(),
+        member: "alice".into(),
+        service: documents.to_string(),
+        permission: "read".into(),
+    });
+    client::trust::sign(&mut grant, &admin)?;
+    let response = client::trust::request(
+        &node,
+        host_key.peer_id(),
+        TrustRequest::Append {
+            record: grant.clone(),
+        },
+    )
+    .await?;
+    assert!(response.error.is_none());
+    cache.append(grant)?;
+    assert_eq!(
+        client::documents::fetch(reader.clone(), input()).await?,
+        b"verified terminal document"
+    );
+    std::fs::write(collection.join(&hash), b"tampered")?;
+    assert!(
+        client::documents::fetch(reader.clone(), input())
+            .await
+            .is_err()
+    );
+    std::fs::write(collection.join(&hash), b"verified terminal document")?;
+    let mut revoke = cache.state().draft(TrustAction::RevokePermission {
+        id: "doc-read".into(),
+    });
+    client::trust::sign(&mut revoke, &admin)?;
+    assert!(
+        client::trust::request(
+            &node,
+            host_key.peer_id(),
+            TrustRequest::Append { record: revoke }
+        )
+        .await?
+        .error
+        .is_none()
+    );
+    assert!(client::documents::fetch(reader, input()).await.is_err());
+    node.shutdown().await?;
+    host.close().await?;
+    Ok(())
+}
