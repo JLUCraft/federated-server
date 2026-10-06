@@ -9,8 +9,10 @@ repository = "https://github.com/JLUCraft/game-server"
 publish = false
 
 [dependencies]
+base64 = "0.22"
+aes-gcm = "0.11"
 state = { path = "../union-core/crates/state" }
-client = { path = "../union-core/crates/client", features = ["office"] }
+client = { path = "../union-core/crates/client", features = ["office", "documents"] }
 events = { path = "../union-core/crates/events", features = ["documents"] }
 flows = { path = "../union-core/crates/flows" }
 llm-gateway = { path = "../union-core/crates/llm-gateway" }
@@ -33,14 +35,16 @@ tracing = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
 terminal-runtime = { path = "../union-core/crates/terminal-runtime" }
 minecraftd = { path = "../minecraftd" }
+web-push = { version = "0.11", default-features = false }
+reqwest = { version = "0.13", features = ["json"] }
 
 [lints.rust]
 unsafe_code = "forbid"
 
 [workspace]
 resolver = "2"
-members = ["tools/unionctl"]
-default-members = [".", "tools/unionctl"]
+members = []
+default-members = ["."]
 
 [dev-dependencies]
 tempfile = "3"
