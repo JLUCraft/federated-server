@@ -21,6 +21,9 @@ fn operation_error(error: anyhow::Error) -> Error {
 pub mod bootstrap;
 pub mod identity_bridge;
 mod office_ai;
+mod office_push;
+mod office_workflows;
+mod report_board;
 pub mod runtime;
 
 #[cfg(test)]

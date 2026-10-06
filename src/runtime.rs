@@ -54,6 +54,9 @@ pub struct Services {
     pub governance: Option<Governance>,
     pub gateway: Option<Gateway>,
     pub ai_worker: Option<AiWorkerConfig>,
+    pub office_worker: Option<crate::office_workflows::Config>,
+    pub office_push: Option<crate::office_push::Config>,
+    pub report_board: Option<crate::report_board::Config>,
     pub operations: Option<Operations>,
     pub member_rooms: Vec<rooms::HostConfig>,
     pub documents: Option<Documents>,
@@ -190,6 +193,15 @@ impl Config {
             relative(base, &mut g.config);
             relative(base, &mut g.ledger);
         }
+        if let Some(p) = &mut config.services.office_push {
+            relative(base, &mut p.key);
+            relative(base, &mut p.store);
+            relative(base, &mut p.vapid_key);
+        }
+        if let Some(a) = &mut config.services.office_worker {
+            relative(base, &mut a.key);
+            relative(base, &mut a.identity);
+        }
         if let Some(a) = &mut config.services.ai_worker {
             relative(base, &mut a.key);
         }
@@ -301,7 +313,10 @@ impl Config {
             "service requires live governance"
         );
         ensure!(
-            self.services.ai_worker.is_none()
+            (self.services.ai_worker.is_none()
+                && self.services.office_worker.is_none()
+                && self.services.office_push.is_none()
+                && self.services.report_board.is_none())
                 || self
                     .services
                     .governance
@@ -345,6 +360,9 @@ impl Config {
         }
         if let Some(d) = &self.services.documents {
             register(&d.service)?;
+        }
+        if let Some(p) = &self.services.office_push {
+            register(&p.service)?;
         }
         let mut directories = HashSet::new();
         let mut backends = HashSet::new();
@@ -390,6 +408,7 @@ pub struct Host {
     fleet: Option<Arc<ops::Fleet>>,
     services: Vec<String>,
     pending_ai: Option<(Authority<Office>, AiWorkerConfig)>,
+    pending_office: Option<(Authority<Office>, crate::office_workflows::Config)>,
     #[cfg(feature = "server")]
     raft: Vec<authority::consensus::Raft>,
     identity: Option<(
@@ -431,6 +450,7 @@ impl Host {
             fleet: None,
             services: Vec::new(),
             pending_ai: None,
+            pending_office: None,
             #[cfg(feature = "server")]
             raft: Vec::new(),
             identity: None,
@@ -457,6 +477,10 @@ impl Host {
             }
             anyhow::bail!("node dispatcher stopped")
         });
+        if let Some((authority, config)) = host.pending_office.take() {
+            host.tasks
+                .spawn(crate::office_workflows::serve(authority, config));
+        }
         if let Some((authority, config)) = host.pending_ai.take() {
             host.tasks.spawn(office_ai::serve(authority, config));
         }
@@ -552,6 +576,36 @@ impl Host {
                 }
                 Domain::Office => {
                     let authority = self.open_authority::<Office>(&g).await?;
+                    if let Some(config) = services.report_board.take() {
+                        self.tasks
+                            .spawn(crate::report_board::serve(authority.clone(), config));
+                        self.services.push("report_board".into());
+                    }
+                    if let Some(config) = services.office_push.take() {
+                        let service = config.service.parse()?;
+                        self.node()?
+                            .publish(Service {
+                                id: service,
+                                name: "Office notifications".into(),
+                                protocol: node::protocol::OFFICE_PUSH_PROTOCOL.into(),
+                                metadata: vec![],
+                                access: self.access("use")?,
+                            })
+                            .await?;
+                        let incoming = self.route(service);
+                        self.tasks.spawn(crate::office_push::serve(
+                            authority.clone(),
+                            config,
+                            incoming,
+                        ));
+                        self.services.push("office_push".into());
+                    }
+
+                    if let Some(config) = services.office_worker.take() {
+                        Identity::load(&config.key)?;
+                        self.pending_office = Some((authority.clone(), config));
+                        self.services.push("office_worker".into());
+                    }
                     if let Some(mut config) = services.ai_worker.take() {
                         if config.address.is_empty() {
                             let node = self.node()?;

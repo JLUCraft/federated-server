@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>高校社团公开报告</title>
+<style>:root{color-scheme:light dark;font-family:system-ui,sans-serif}body{max-width:60rem;margin:auto;padding:1.5rem}article{border-block-end:1px solid;padding:1rem 0}button{min-height:48px;padding:.5rem 1rem}a{display:inline-block;min-height:48px;align-content:center}#status{min-height:2rem}</style>
+<h1>高校社团公开报告</h1><p>各校发布的 MUA 年度报告与校内年审报告。修订稿在重新发布后更新。</p>
+<p id="status" role="status" aria-live="polite">正在加载</p><main id="reports"></main><button id="more" type="button">加载报告</button>
+<script>
+let after=null;const more=document.getElementById('more'),status=document.getElementById('status'),reports=document.getElementById('reports');
+async function load(){more.disabled=true;status.textContent='正在加载';try{const response=await fetch('/reports.json'+(after?'?after='+encodeURIComponent(after):''));if(!response.ok)throw new Error();const page=await response.json();for(const item of page.reports){const r=item.report,article=document.createElement('article'),heading=document.createElement('h2'),period=document.createElement('p'),link=document.createElement('a');heading.textContent=r.club+' · '+(r.kind==='mua_annual'?'MUA 年度报告':'校内年审报告');period.textContent=new Date(r.period_start_ms).toLocaleString('zh-CN')+' 至 '+new Date(r.period_end_ms).toLocaleString('zh-CN')+'（结束时刻不含），版本 '+r.version;link.textContent='阅读报告：'+item.id;link.href='/reports/'+encodeURIComponent(item.id);article.append(heading,period,link);reports.append(article)}after=page.next;status.textContent=reports.children.length?'报告已加载':'尚无已发布报告';more.hidden=!after;more.disabled=false}catch{status.textContent='报告暂时无法加载，请重试';more.textContent='重试';more.disabled=false}}
+more.addEventListener('click',load);load();
+</script></html>
