@@ -12,20 +12,33 @@ use tokio::{
 
 #[tokio::test]
 async fn unified_identity_drives_office_gateway_and_automatic_worker() -> Result<()> {
-    automatic_flow(false).await
+    automatic_flow(false, None).await
 }
 #[cfg(feature = "server")]
 #[tokio::test]
 async fn replicated_office_runs_automatic_worker_and_replays_identity_witnesses() -> Result<()> {
-    automatic_flow(true).await
+    automatic_flow(true, None).await
 }
-async fn automatic_flow(replicated: bool) -> Result<()> {
+#[tokio::test]
+async fn automatic_review_applies_decisions_and_pauses_on_invalid_output() -> Result<()> {
+    for decision in [
+        "approve",
+        "changes_requested",
+        "reject",
+        "invalid",
+        "timeout",
+    ] {
+        automatic_flow(false, Some(decision)).await?;
+    }
+    Ok(())
+}
+async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let dir=tempfile::tempdir()?;
         let admin=Identity::generate(); let worker=Identity::generate(); let human=Identity::generate();
         let now=now_ms()?;
         let mut genesis;
-        let template=flows::Template{name:"summarize then review".into(),payload_kinds:["events.create".into()].into(),stages:vec![flows::Stage{name:"summary".into(),approver:flows::Approver::Ai{worker:"worker".into(),model:"local".into(),purpose:"events.summary".into(),privacy:Privacy::Sensitive,max_tokens:32},timeout_ms:None,on_timeout:flows::TimeoutPolicy::Reject}]};
+        let template=flows::Template{name:"summarize then review".into(),payload_kinds:[if decision.is_some() {"events.approve".into()} else {"events.create".into()}].into(),stages:vec![flows::Stage{name:"summary".into(),approver:flows::Approver::Ai{mode:if decision.is_some() {flows::AiMode::Review} else {flows::AiMode::Generate},worker:"worker".into(),model:"local".into(),purpose:"events.summary".into(),privacy:Privacy::Sensitive,max_tokens:32},timeout_ms:if decision==Some("timeout") {Some(2000)} else {None},on_timeout:flows::TimeoutPolicy::Reject}]};
         let listener=TcpListener::bind("127.0.0.1:0").await?;
         let url=format!("http://{}/v1/chat/completions",listener.local_addr()?);
         let calls=Arc::new(AtomicUsize::new(0));let count=calls.clone();
@@ -37,9 +50,21 @@ async fn automatic_flow(replicated: bool) -> Result<()> {
             let length:usize=header.lines().find_map(|line|line.to_lowercase().strip_prefix("content-length:").map(|n|n.trim().parse().unwrap())).unwrap();
             let mut body=vec![0;length];socket.read_exact(&mut body).await.unwrap();
             let request:serde_json::Value=serde_json::from_slice(&body).unwrap();
-            assert_eq!(request["messages"][0]["content"],"Summarize: meeting notes");
+            assert_eq!(request["messages"][0]["role"],"system");
+            assert_eq!(request["messages"][1]["role"],"user");
+            let context:serde_json::Value=serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(context["material"],"meeting notes");
+            assert_eq!(context["task"],"events.summary");
+            assert_eq!(context["mode"],if decision.is_some() {"review"} else {"generate"});
             count.fetch_add(1,Ordering::SeqCst);
-            let body="data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"summary result\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\ndata: [DONE]\n\n";
+            if decision==Some("timeout") {tokio::time::sleep(std::time::Duration::from_secs(3)).await;return;}
+            let content=match decision {
+                None => "summary result".to_owned(),
+                Some("invalid") => "looks good".to_owned(),
+                Some(decision) => serde_json::json!({"decision":decision,"summary":"Review complete","issues":["Verify consent"]}).to_string(),
+            };
+            let delta=serde_json::json!({"choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]}).to_string();
+            let body=format!("data: {delta}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}}}\n\ndata: [DONE]\n\n");
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
         });
         let host_key=Identity::generate();
@@ -95,7 +120,7 @@ async fn automatic_flow(replicated: bool) -> Result<()> {
         std::fs::write(dir.path().join("gateway.json"),serde_json::to_vec(&serde_json::json!({
             "providers":[{"url":url,"key_env":null,"sensitive":true,"self_hosted":true,"models":["local"],"context_tokens":128}],
             "members":{"worker":{"tokens_per_day":1024,"models":["local"]}},"purposes":["events.summary"],
-            "templates":{"events.summary":"Summarize: {context}"},"max_tokens":32,"max_messages":2,"max_input_bytes":1024,"concurrency":1
+            "max_tokens":32,"max_messages":2,"max_input_bytes":4096,"concurrency":1
         }))?)?;
         let config_path=dir.path().join("node.json");
         std::fs::write(&config_path,serde_json::to_vec(&config)?)?;
@@ -114,16 +139,28 @@ async fn automatic_flow(replicated: bool) -> Result<()> {
         let input=client::office::upload(&client_node,host_key.peer_id(),&hash,&human,client::office::Upload{branch:"main",path:"notes.txt",message:"meeting input",bytes:b"meeting notes"},&cache).await?;
         let snapshot=client::office::snapshot(&client_node,host_key.peer_id(),&hash).await?;
         let mut updates=authority::events::subscribe(&client_node,host_key.peer_id(),snapshot.revision).await?;
-        let action=state::governance::Action::Domain(F::Start{id:"flow".into(),template:"summary".into(),input:Some(input.clone()),payload:events::EventAction::Create{id:"event".into(),title:"meeting".into(),brief_hash:input.to_string(),window:events::Window{opens_ms:now+60000,closes_ms:now+120000,starts_ms:now+180000}}});
+        let create=events::EventAction::Create{id:"event".into(),title:"meeting".into(),brief_hash:input.to_string(),window:events::Window{opens_ms:now+60000,closes_ms:now+120000,starts_ms:now+180000}};
+        let payload=if decision.is_some() {
+            for action in [create,events::EventAction::Submit{id:"event".into()}] {
+                let reply=client::trust::execute::<Office>(&client_node,host_key.peer_id(),&hash,&human,&cache,state::governance::Action::Domain(F::Inner(action))).await?;
+                assert!(reply.error.is_none());
+            }
+            events::EventAction::Approve{id:"event".into(),epoch:1,co_organizers:Default::default()}
+        } else {create};
+        let action=state::governance::Action::Domain(F::Start{id:"flow".into(),template:"summary".into(),input:Some(input.clone()),payload});
         let reply=client::trust::execute::<Office>(&client_node,host_key.peer_id(),&hash,&human,&cache,action).await?;
         assert!(reply.error.is_none(),"{:?}",reply.error);
         let state=loop {
             let snapshot=client::office::snapshot(&client_node,host_key.peer_id(),&hash).await?;
-            if snapshot.domain.flows["flow"].status==flows::Status::Approved {break snapshot;}
+            let flow=&snapshot.domain.flows["flow"];
+            let expected=match decision {Some("reject" | "timeout")=>flows::Status::Rejected,Some("changes_requested")=>flows::Status::ChangesRequested,Some("invalid")=>flows::Status::Active,_=>flows::Status::Approved};
+            if flow.status==expected && flow.records[0].ai_runs.last().is_some_and(|r|r.output.is_some() || r.error.is_some()) {break snapshot;}
             authority::events::next(&mut updates).await?;
         };
-        let output=state.domain.flows["flow"].records[0].ai_runs[0].output.as_ref().unwrap();
-        assert_eq!(state.domain.inner.files.read(output)?,b"summary result");
+        let run=&state.domain.flows["flow"].records[0].ai_runs[0];
+        if matches!(decision,Some("invalid" | "timeout")) {assert!(run.output.is_none());assert!(run.error.is_some());}
+        else if decision.is_some() {assert!(run.review.is_some());}
+        else {assert_eq!(state.domain.inner.files.read(run.output.as_ref().unwrap())?,b"summary result");}
         assert_eq!(calls.load(Ordering::SeqCst),1);
         provider.await?;
         drop(updates);

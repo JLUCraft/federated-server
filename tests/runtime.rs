@@ -61,7 +61,7 @@ async fn office_gateway_and_operations_share_peer_governance_and_revocation() ->
         let pin = node::protocol::digest(&serde_json::to_vec(&genesis)?);
         write(&dir.path().join("gateway.json"),&json!({
             "providers":[{"url":"http://127.0.0.1:1/v1/chat/completions","key_env":null,"sensitive":true,"self_hosted":true,"models":["local"],"context_tokens":128}],
-            "members":{"alice":{"tokens_per_day":1024,"models":["local"]}},"purposes":["assistant.ask"],
+            "members":{"alice":{"tokens_per_day":1024,"models":["local"]}},"purposes":["events.summary"],
             "max_tokens":32,"max_messages":2,"max_input_bytes":128,"concurrency":1
         }))?;
         let path = dir.path().join("node.json");

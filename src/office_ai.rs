@@ -3,6 +3,7 @@ use crate::runtime::Office;
 use anyhow::{Context, Result, bail};
 use authority::authority::Authority;
 use authority::journal::now_ms;
+use base64::Engine;
 use identity::Identity;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -65,14 +66,37 @@ pub async fn serve(authority: Authority<Office>, config: Config) -> Result<()> {
                 .iter()
                 .find(|(_, m)| m.owns(&device))
                 .map(|(id, _)| id);
+            let now = now_ms()?;
+            let expired: Vec<_> = state
+                .domain
+                .flows
+                .iter()
+                .filter_map(|(id, flow)| {
+                    let template = flows::template_for(&state.domain.flow_templates, flow).ok()?;
+                    let flows::Approver::Ai { worker: owner, .. } =
+                        &template.stages.get(flow.current)?.approver
+                    else {
+                        return None;
+                    };
+                    (flow.status == flows::Status::Active
+                        && Some(owner) == worker
+                        && flow.deadline_ms.is_some_and(|t| now >= t))
+                    .then(|| id.clone())
+                })
+                .collect();
+            if !expired.is_empty() {
+                for instance in expired {
+                    let _ = apply(&authority, &identity, F::Poke { instance }).await;
+                }
+                wait_updates(&mut updates, &mut identity_updates).await?;
+                continue;
+            }
             {
                 state
                     .domain
                     .flows
                     .keys()
-                    .filter_map(|id| flows::ai_job(&state.domain, id).transpose())
-                    .collect::<client::Result<Vec<_>>>()?
-                    .into_iter()
+                    .filter_map(|id| flows::ai_job(&state.domain, id).ok().flatten())
                     .find(|job| {
                         Some(&job.worker) == worker
                             && state.domain.flows[&job.instance]
@@ -171,14 +195,14 @@ async fn execute(
     unified: &authority::trust::TrustView,
 ) -> Result<client::protocol::Cid> {
     let epoch = authority.effect_epoch().context("executor is not leader")?;
-    let input = authority
-        .state(identity.peer_id())
-        .await?
-        .domain
-        .inner
-        .files
-        .read(&job.input)?;
-    let context = String::from_utf8(input).context("AI input must be UTF-8")?;
+    let snapshot = authority.state(identity.peer_id()).await?;
+    let input = snapshot.domain.inner.files.read(&job.input)?;
+    let (attachments, required_capabilities) =
+        document_attachments(&snapshot.domain.inner, &input)?;
+    let content = String::from_utf8(input).context("AI input must be UTF-8")?;
+    let context = serde_json::to_string(
+        &serde_json::json!({"task":job.purpose,"mode":job.mode,"job":job.job,"input":job.input,"material":content}),
+    )?;
     let mut updates = authority.watch().await;
     let request = client::llm::execute(
         identity.clone(),
@@ -187,6 +211,8 @@ async fn execute(
             peer: config.peer.clone(),
             service: config.service.clone(),
             request: client::protocol::LlmRequest {
+                attachments,
+                required_capabilities,
                 model: job.model.clone(),
                 purpose: job.purpose.clone(),
                 privacy: job.privacy,
@@ -219,6 +245,7 @@ async fn execute(
     if completion.truncated || completion.error.is_some() || completion.content.is_empty() {
         bail!("incomplete model output");
     }
+    flows::validate_ai_output(job.mode, completion.content.as_bytes())?;
     let state = authority.state(identity.peer_id()).await?;
     if authority.effect_epoch() != Some(epoch) || !running(&state, identity, job, unified)? {
         bail!("AI stage changed");
@@ -254,6 +281,17 @@ fn running(
         if !state.can_write(&device, &current) {
             return Ok(false);
         }
+    }
+    if job.mode == flows::AiMode::Review
+        && <events::EventsDomain as state::Domain>::review_artifact(
+            &state.domain.inner,
+            &flow.payload,
+        )
+        .ok()
+        .as_deref()
+            != Some(job.input.to_string().as_str())
+    {
+        return Ok(false);
     }
     let core = effective_core(state, unified)?;
     Ok(core
@@ -293,3 +331,63 @@ fn effective_core(
 #[cfg(test)]
 #[path = "office_ai_tests.rs"]
 mod tests;
+
+fn document_attachments(
+    state: &events::EventsState,
+    input: &[u8],
+) -> Result<(
+    Vec<node::protocol::LlmAttachment>,
+    std::collections::BTreeSet<node::protocol::LlmCapability>,
+)> {
+    fn collect(value: &serde_json::Value, cids: &mut std::collections::BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map
+                    .get("requires_document_review")
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+                    && let Some(cid) = map.get("cid").and_then(|v| v.as_str())
+                {
+                    cids.insert(cid.into());
+                }
+                for child in map.values() {
+                    collect(child, cids);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    collect(child, cids);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut cids = std::collections::BTreeSet::new();
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(input) {
+        collect(&value, &mut cids);
+    }
+    let mut attachments = Vec::new();
+    let mut capabilities = std::collections::BTreeSet::new();
+    for cid in cids {
+        let bytes = state.files.read(&cid.parse()?)?;
+        let mime = node::protocol::llm_document_mime(&bytes)
+            .context("unsupported office document format")?;
+        let extension = match mime {
+            "application/pdf" => {
+                capabilities.insert(node::protocol::LlmCapability::Pdf);
+                "pdf"
+            }
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            _ => "webp",
+        };
+
+        capabilities.insert(node::protocol::LlmCapability::Vision);
+        attachments.push(node::protocol::LlmAttachment {
+            name: format!("{cid}.{extension}"),
+            mime: mime.into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+    }
+    Ok((attachments, capabilities))
+}
