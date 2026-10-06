@@ -210,10 +210,12 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
             Profile {
                 uuid: uuid::Uuid::from_u128(1),
                 name: "Alice".into(),
+                textures: None,
             },
             Profile {
                 uuid: uuid::Uuid::from_u128(2),
                 name: "Bob".into(),
+                textures: None,
             },
         ];
         let mut identities = crate::test_identity::Identities::new(
@@ -320,6 +322,7 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
             service: service.to_string(),
             waiting: waiting_config,
             arena: arena_config,
+            skin_site: None,
         };
         let incoming = gateway.take_incoming()?;
         let gateway = Arc::new(gateway);
@@ -436,4 +439,21 @@ fn native_configuration_rejects_a_separate_player_roster() {
     assert!(serde_json::from_value::<Config>(config.clone()).is_ok());
     config["players"] = serde_json::json!({});
     assert!(serde_json::from_value::<Config>(config).is_err());
+}
+
+#[test]
+fn documented_gateway_configuration_parses_and_rejects_unsafe_skin_sites() {
+    let document = |skin_site: serde_json::Value| {
+        serde_json::from_value::<Config>(serde_json::json!({
+            "league": "cup",
+            "service": ServiceId::new().to_string(),
+            "waiting": {"endpoint": {"transport": "local", "address": "127.0.0.1:25566"}, "forwarding_secret": "waiting.secret"},
+            "arena": {"endpoint": {"transport": "local", "address": "127.0.0.1:25567"}, "forwarding_secret": "arena.secret"},
+            "skin_site": skin_site,
+        }))
+    };
+    assert!(document(serde_json::json!("https://skin.jlucraft.com")).is_ok());
+    assert!(document(serde_json::Value::Null).is_ok());
+    assert!(document(serde_json::json!("http://skin.jlucraft.com")).is_err());
+    assert!(document(serde_json::json!("https://skin.jlucraft.com/path")).is_err());
 }

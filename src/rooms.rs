@@ -1,4 +1,5 @@
 //! Member-owned rooms: local instance lifecycle and delegated game admission.
+use crate::skins::SkinSite;
 use crate::wire::{self, Fields, Packet};
 use anyhow::{Context, Result, ensure};
 use minecraftd::{
@@ -76,12 +77,16 @@ pub struct HostConfig {
     pub forwarding_secret: PathBuf,
     pub club: String,
     pub join_clubs: std::collections::BTreeSet<String>,
+    /// The skin station whose textures are forwarded with each player.
+    #[serde(default)]
+    pub skin_site: Option<SkinSite>,
 }
 struct RoomSettings {
     service: String,
     name: String,
     instance: InstanceConfig,
     forwarding_secret: PathBuf,
+    skin_site: Option<SkinSite>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct HostStatus {
@@ -172,6 +177,7 @@ impl LocalRoom {
             name: config.name,
             instance: config.instance,
             forwarding_secret: config.forwarding_secret,
+            skin_site: config.skin_site,
         };
         Self::start_configured(
             node,
@@ -270,6 +276,7 @@ impl LocalRoom {
                     name: config.name, addresses: node.addresses().iter().map(ToString::to_string).collect(), metadata };
                 if ready.send(status).is_err() { return Ok(()); }
                 let forwarding_secret = Arc::new(config.forwarding_secret);
+                let skin_site = Arc::new(config.skin_site);
                 let mut tasks = JoinSet::new();
                 loop {
                     identity_view.mark_seen();
@@ -287,8 +294,9 @@ impl LocalRoom {
                             let Some(session) = session else { break; };
                             let backend = config.instance.backend;
                             let secret = forwarding_secret.clone();
+                            let skin = skin_site.clone();
                             tasks.spawn(async move {
-                                if let Err(error) = bridge(session, backend, &secret).await {
+                                if let Err(error) = bridge(session, backend, &secret, skin.as_ref().as_ref()).await {
                                     tracing::debug!(%error, "room session ended");
                                 }
                             });
@@ -366,6 +374,7 @@ async fn bridge(
     session: IncomingSession,
     backend: SocketAddr,
     secret: &std::path::Path,
+    skin_site: Option<&SkinSite>,
 ) -> Result<()> {
     let claims = session
         .claims
@@ -412,6 +421,7 @@ async fn bridge(
                 crate::forwarding::Profile {
                     uuid: profile,
                     name,
+                    textures: None,
                 },
             ))
         } else {
@@ -424,6 +434,13 @@ async fn bridge(
     remote.set_nodelay(true)?;
     wire::write_frame(&mut remote, &handshake).await?;
     if let Some((login, profile)) = login {
+        let profile = crate::forwarding::Profile {
+            textures: match skin_site {
+                Some(site) => site.textures(profile.uuid, &profile.name).await,
+                None => None,
+            },
+            ..profile
+        };
         wire::write_frame(&mut remote, &login).await?;
         // Complete and verify backend identity forwarding before exposing login success.
         timeout(CONNECT_TIMEOUT, async {

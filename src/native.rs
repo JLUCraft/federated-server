@@ -53,6 +53,7 @@ pub struct Backend {
     pub forwarding_secret: PathBuf,
 }
 use crate::forwarding::Profile;
+use crate::skins::SkinSite;
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -60,6 +61,9 @@ pub struct Config {
     pub service: String,
     pub waiting: Backend,
     pub arena: Backend,
+    /// The skin station whose textures are forwarded with each player.
+    #[serde(default)]
+    pub skin_site: Option<SkinSite>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Room {
@@ -375,7 +379,7 @@ async fn session(
     let name = fields.text(16)?.to_owned();
     let uuid = uuid::Uuid::from_slice(fields.bytes(16)?)?;
     fields.finish()?;
-    let (member, id, profile, selected, backend) = {
+    let (member, id, profile, selected, backend, skin_site) = {
         let mut runtime = shared.lock().await;
         let member = {
             let j = runtime.cache.read().await;
@@ -394,6 +398,7 @@ async fn session(
             Profile {
                 uuid,
                 name: name.clone(),
+                textures: None,
             }
         };
         ensure!(
@@ -425,10 +430,24 @@ async fn session(
                 },
             },
         );
-        (member, id, profile, selected, backend)
+        (
+            member,
+            id,
+            profile,
+            selected,
+            backend,
+            runtime.config.skin_site.clone(),
+        )
     };
     tracing::info!(member = %member, device = %peer, profile = %profile.uuid, display_name = %profile.name, "verified game identity forwarding");
     let result = async {
+        let profile = Profile {
+            textures: match &skin_site {
+                Some(site) => site.textures(profile.uuid, &profile.name).await,
+                None => None,
+            },
+            ..profile.clone()
+        };
         let mut remote = backend.connect(&node).await?;
         wire::write_packet(
             &mut remote,

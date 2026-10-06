@@ -6,12 +6,36 @@ use serde::Deserialize;
 use sha2::Sha256;
 use std::path::Path;
 
+/// The Velocity `textures` profile property, the only property the gateway forwards.
+/// Only the skin module can construct one, after checking what it describes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Textures {
+    value: String,
+    signature: Option<String>,
+}
+impl Textures {
+    pub(crate) fn new(value: String, signature: Option<String>) -> Self {
+        Self { value, signature }
+    }
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+    pub fn signature(&self) -> Option<&str> {
+        self.signature.as_deref()
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub uuid: uuid::Uuid,
     pub name: String,
+    /// Filled by the gateway after admission; never taken from configuration.
+    #[serde(skip)]
+    pub textures: Option<Textures>,
 }
+
+pub const TEXTURES_PROPERTY: &str = "textures";
 
 pub fn validate_name(name: &str) -> Result<()> {
     ensure!(
@@ -41,6 +65,21 @@ pub fn encode(path: &Path, profile: &Profile) -> Result<Vec<u8>> {
     wire::string("127.0.0.1", &mut data)?;
     data.extend(profile.uuid.as_bytes());
     wire::string(&profile.name, &mut data)?;
+    match &profile.textures {
+        None => wire::varint(0, &mut data),
+        Some(textures) => {
+            wire::varint(1, &mut data);
+            wire::string(TEXTURES_PROPERTY, &mut data)?;
+            wire::string(textures.value(), &mut data)?;
+            match textures.signature() {
+                Some(signature) => {
+                    data.push(1);
+                    wire::string(signature, &mut data)?;
+                }
+                None => data.push(0),
+            }
+        }
+    }
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
     mac.update(&data);
     let mut result = mac.finalize().into_bytes().to_vec();
@@ -117,10 +156,53 @@ impl LoginNegotiation {
 mod tests {
     use super::*;
     #[test]
+    fn encoded_identity_carries_typed_textures_after_the_name() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("secret");
+        std::fs::write(&path, "s".repeat(32))?;
+        for (textures, count) in [
+            (None, 0),
+            (
+                Some(Textures::new("dmFsdWU=".into(), Some("sig".into()))),
+                1,
+            ),
+            (Some(Textures::new("dmFsdWU=".into(), None)), 1),
+        ] {
+            let profile = Profile {
+                uuid: uuid::Uuid::from_u128(9),
+                name: "Alice".into(),
+                textures: textures.clone(),
+            };
+            let encoded = encode(&path, &profile)?;
+            let (mac, data) = encoded.split_at(32);
+            let mut expected = Hmac::<Sha256>::new_from_slice("s".repeat(32).as_bytes())?;
+            expected.update(data);
+            expected.verify_slice(mac)?;
+            let mut fields = wire::Fields::new(data);
+            assert_eq!(fields.int()?, 1);
+            assert_eq!(fields.text(255)?, "127.0.0.1");
+            assert_eq!(fields.bytes(16)?, profile.uuid.as_bytes());
+            assert_eq!(fields.text(16)?, "Alice");
+            assert_eq!(fields.int()?, count);
+            if let Some(textures) = textures {
+                assert_eq!(fields.text(64)?, TEXTURES_PROPERTY);
+                assert_eq!(fields.text(32767)?, textures.value());
+                let signed = fields.bytes(1)?[0];
+                assert_eq!(signed == 1, textures.signature().is_some());
+                if let Some(signature) = textures.signature() {
+                    assert_eq!(fields.text(32767)?, signature);
+                }
+            }
+            fields.finish()?;
+        }
+        Ok(())
+    }
+    #[test]
     fn forwarding_requires_one_query_and_exact_backend_identity() -> Result<()> {
         let profile = Profile {
             uuid: uuid::Uuid::nil(),
             name: "Player".into(),
+            textures: None,
         };
         let mut login = LoginNegotiation::default();
         let mut success = profile.uuid.as_bytes().to_vec();

@@ -53,6 +53,7 @@ async fn managed_room_publishes_after_readiness_and_withdraws_on_stop() -> Resul
         std::fs::write(&key, "b".repeat(32))?;
         let config = HostConfig {
             forwarding_secret: key,
+            skin_site: None,
             service: ServiceId::new().to_string(), name: "Managed room".into(),
             instance: InstanceConfig {
                 id: "managed".into(), directory: dir.path().to_path_buf(), backend,
@@ -188,7 +189,8 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let backend = listener.local_addr()?;
             let key = secret.clone();
-            let bridge = tokio::spawn(async move { super::bridge(session, backend, &key).await });
+            let bridge =
+                tokio::spawn(async move { super::bridge(session, backend, &key, None).await });
             let mut stream = stream.compat();
             let (handshake, login) = login(uuid::Uuid::from_u128(to as u128 + 1))?;
             wire::write_frame(&mut stream, &handshake).await?;
@@ -212,7 +214,8 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let backend = listener.local_addr()?;
             let key = secret.clone();
-            let bridge = tokio::spawn(async move { super::bridge(session, backend, &key).await });
+            let bridge =
+                tokio::spawn(async move { super::bridge(session, backend, &key, None).await });
             let mut stream = stream.compat();
             let profile = uuid::Uuid::from_u128(from as u128 + 1);
             let (handshake, login) = login(profile)?;
