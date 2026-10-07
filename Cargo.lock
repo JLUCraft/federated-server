@@ -291,12 +291,12 @@ dependencies = [
  "journal",
  "node",
  "openraft",
+ "protocol",
  "serde",
  "serde_json",
  "state",
  "tokio",
  "tracing",
- "wire",
 ]
 
 [[package]]
@@ -720,11 +720,11 @@ dependencies = [
  "flows",
  "identity",
  "node",
+ "protocol",
  "serde",
  "serde_json",
  "state",
  "tokio",
- "wire",
 ]
 
 [[package]]
@@ -1339,11 +1339,11 @@ name = "events"
 version = "0.1.0"
 dependencies = [
  "node",
+ "protocol",
  "serde",
  "serde_json",
  "state",
  "tokio",
- "wire",
 ]
 
 [[package]]
@@ -1452,10 +1452,10 @@ dependencies = [
 name = "flows"
 version = "0.1.0"
 dependencies = [
+ "protocol",
  "serde",
  "serde_json",
  "state",
- "wire",
 ]
 
 [[package]]
@@ -2152,10 +2152,10 @@ name = "identity"
 version = "0.2.0"
 dependencies = [
  "libp2p-identity",
+ "protocol",
  "serde",
  "serde_json",
  "tempfile",
- "wire",
 ]
 
 [[package]]
@@ -2383,13 +2383,13 @@ version = "0.2.0"
 dependencies = [
  "identity",
  "openraft",
+ "protocol",
  "serde",
  "serde_json",
  "state",
  "tempfile",
  "tokio",
  "uuid",
- "wire",
 ]
 
 [[package]]
@@ -2467,11 +2467,11 @@ version = "0.2.0"
 dependencies = [
  "authority",
  "identity",
+ "protocol",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "state",
- "wire",
 ]
 
 [[package]]
@@ -2985,6 +2985,7 @@ dependencies = [
  "futures",
  "identity",
  "node",
+ "protocol",
  "reqwest",
  "serde",
  "serde_json",
@@ -2992,7 +2993,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "wire",
 ]
 
 [[package]]
@@ -3343,12 +3343,12 @@ dependencies = [
  "libp2p",
  "libp2p-stream",
  "prost",
+ "protocol",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "uuid",
- "wire",
 ]
 
 [[package]]
@@ -3900,6 +3900,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "protocol"
+version = "0.2.0"
+dependencies = [
+ "futures",
+ "multibase",
+ "prost",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4815,9 +4828,9 @@ version = "0.2.0"
 dependencies = [
  "identity",
  "multiaddr",
+ "protocol",
  "serde",
  "serde_json",
- "wire",
 ]
 
 [[package]]
@@ -5883,19 +5896,6 @@ checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
 dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "wire"
-version = "0.2.0"
-dependencies = [
- "futures",
- "multibase",
- "prost",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "thiserror 2.0.21",
 ]
 
 [[package]]

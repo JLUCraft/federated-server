@@ -1,6 +1,6 @@
 //! Native union-authenticated Minecraft gateway. Backends are local sockets or
 //! encrypted union services; neither a proxy server nor an auth plugin is used.
-use crate::wire::{self, Fields, Packet};
+use crate::protocol::{self, Fields, Packet};
 use anyhow::{Result, bail, ensure};
 use identity::Identity;
 use league::{
@@ -134,13 +134,13 @@ impl Backend {
     async fn healthy(&self, node: &Node) -> bool {
         timeout(Duration::from_secs(3), async {
             let mut stream = self.connect(node).await?;
-            wire::write_packet(
+            protocol::write_packet(
                 &mut stream,
-                handshake("localhost", wire::DEFAULT_MC_PORT, 1)?,
+                handshake("localhost", protocol::DEFAULT_MC_PORT, 1)?,
                 None,
             )
             .await?;
-            wire::write_packet(
+            protocol::write_packet(
                 &mut stream,
                 Packet {
                     id: 0,
@@ -149,13 +149,13 @@ impl Backend {
                 None,
             )
             .await?;
-            let status = Packet::decode(&wire::read_frame(&mut stream).await?, None)?;
+            let status = Packet::decode(&protocol::read_frame(&mut stream).await?, None)?;
             ensure!(status.id == 0, "invalid status");
             let mut fields = Fields::new(&status.body);
             let value: serde_json::Value = serde_json::from_str(fields.text(32767)?)?;
             fields.finish()?;
             ensure!(
-                value["version"]["protocol"] == wire::VERSION,
+                value["version"]["protocol"] == protocol::VERSION,
                 "backend protocol mismatch"
             );
             Ok::<(), anyhow::Error>(())
@@ -169,10 +169,10 @@ impl Backend {
 }
 fn handshake(host: &str, port: u16, intention: u32) -> Result<Packet> {
     let mut body = vec![];
-    wire::varint(wire::VERSION as u32, &mut body);
-    wire::string(host, &mut body)?;
+    protocol::varint(protocol::VERSION as u32, &mut body);
+    protocol::string(host, &mut body)?;
     body.extend(port.to_be_bytes());
-    wire::varint(intention, &mut body);
+    protocol::varint(intention, &mut body);
     Ok(Packet { id: 0, body })
 }
 async fn action(runtime: &Runtime, action: Action) -> Result<()> {
@@ -311,7 +311,7 @@ async fn monitor(shared: Shared, node: Arc<Node>, changed: watch::Sender<()>) ->
 }
 async fn reader<R: AsyncRead + Unpin>(mut read: R, tx: mpsc::Sender<Result<Vec<u8>>>) {
     loop {
-        let packet = wire::read_frame(&mut read).await;
+        let packet = protocol::read_frame(&mut read).await;
         let failed = packet.is_err();
         if tx.send(packet).await.is_err() || failed {
             break;
@@ -319,23 +319,23 @@ async fn reader<R: AsyncRead + Unpin>(mut read: R, tx: mpsc::Sender<Result<Vec<u
     }
 }
 async fn status<S: GameStream>(stream: &mut S) -> Result<()> {
-    let request = Packet::decode(&wire::read_frame(stream).await?, None)?;
+    let request = Packet::decode(&protocol::read_frame(stream).await?, None)?;
     ensure!(
         request.id == 0 && request.body.is_empty(),
         "invalid status request"
     );
     let value = serde_json::json!({
-        "version": {"name": "26.3", "protocol": wire::VERSION},
+        "version": {"name": "26.3", "protocol": protocol::VERSION},
         "players": {"max": 256, "online": 0},
         "description": {"text": STATUS_DESCRIPTION},
     })
     .to_string();
     let mut body = vec![];
-    wire::string(&value, &mut body)?;
-    wire::write_packet(stream, Packet { id: 0, body }, None).await?;
-    let ping = Packet::decode(&wire::read_frame(stream).await?, None)?;
+    protocol::string(&value, &mut body)?;
+    protocol::write_packet(stream, Packet { id: 0, body }, None).await?;
+    let ping = Packet::decode(&protocol::read_frame(stream).await?, None)?;
     ensure!(ping.id == 1 && ping.body.len() == 8, "invalid ping");
-    wire::write_packet(stream, ping, None).await
+    protocol::write_packet(stream, ping, None).await
 }
 async fn session(
     incoming: IncomingSession,
@@ -350,7 +350,7 @@ async fn session(
     let admission: node::protocol::TrustAdmission = serde_json::from_slice(claims)?;
     let peer = incoming.peer.to_string();
     let mut client = incoming.stream.compat();
-    let first = timeout(Duration::from_secs(10), wire::read_frame(&mut client)).await??;
+    let first = timeout(Duration::from_secs(10), protocol::read_frame(&mut client)).await??;
     let first = Packet::decode(&first, None)?;
     ensure!(first.id == 0, "expected handshake");
     let mut fields = Fields::new(&first.body);
@@ -363,7 +363,7 @@ async fn session(
         return timeout(Duration::from_secs(10), status(&mut client)).await?;
     }
     ensure!(
-        version == wire::VERSION && (intention == 2 || intention == 3),
+        version == protocol::VERSION && (intention == 2 || intention == 3),
         "unsupported Minecraft version or intention"
     );
     ensure!(
@@ -371,7 +371,7 @@ async fn session(
         "client must connect through launcher loopback endpoint"
     );
     let login = Packet::decode(
-        &timeout(Duration::from_secs(10), wire::read_frame(&mut client)).await??,
+        &timeout(Duration::from_secs(10), protocol::read_frame(&mut client)).await??,
         None,
     )?;
     ensure!(login.id == 0, "expected login start");
@@ -449,13 +449,13 @@ async fn session(
             ..profile.clone()
         };
         let mut remote = backend.connect(&node).await?;
-        wire::write_packet(
+        protocol::write_packet(
             &mut remote,
-            handshake("localhost", wire::DEFAULT_MC_PORT, 2)?,
+            handshake("localhost", protocol::DEFAULT_MC_PORT, 2)?,
             None,
         )
         .await?;
-        wire::write_packet(&mut remote, login, None).await?;
+        protocol::write_packet(&mut remote, login, None).await?;
         let (cr, mut cw) = tokio::io::split(client);
         let (br, mut bw) = tokio::io::split(remote);
         let (ct, mut cx) = mpsc::channel(1);
@@ -488,15 +488,15 @@ async fn session(
                 // this task's final cleanup, which is guarded by the session generation.
                 finish(&shared, &member, id).await?;
                 let mut body = vec![];
-                wire::string("127.0.0.1", &mut body)?;
-                wire::varint(u32::from(port), &mut body);
-                wire::write_packet(
+                protocol::string("127.0.0.1", &mut body)?;
+                protocol::varint(u32::from(port), &mut body);
+                protocol::write_packet(
                     &mut cw,
                     Packet {
                         id: if stage == Stage::Play {
-                            wire::PLAY_TRANSFER
+                            protocol::PLAY_TRANSFER
                         } else {
-                            wire::CONFIGURATION_TRANSFER
+                            protocol::CONFIGURATION_TRANSFER
                         },
                         body,
                     },
@@ -535,14 +535,14 @@ async fn session(
                             announced = true;
                         }
                     }
-                    Stage::ReconfigurationAck if p.id == wire::PLAY_RECONFIGURE_ACK => {
+                    Stage::ReconfigurationAck if p.id == protocol::PLAY_RECONFIGURE_ACK => {
                         ensure!(p.body.is_empty(), "invalid reconfiguration acknowledgment");
                         stage = Stage::Configuration;
                     }
                     _ => {}
                 }
                 if stage == Stage::Play
-                    && p.id == wire::PLAY_KEEPALIVE_REPLY
+                    && p.id == protocol::PLAY_KEEPALIVE_REPLY
                     && let Some((expected, sent)) = keepalive.take()
                 {
                     ensure!(p.body == expected, "unexpected keepalive reply");
@@ -554,7 +554,7 @@ async fn session(
                         active.health.rtt_ms = rtt;
                     }
                 }
-                wire::write_frame(&mut bw, &raw).await?;
+                protocol::write_frame(&mut bw, &raw).await?;
             } else {
                 let raw = raw.ok_or_else(|| anyhow::anyhow!("backend closed"))??;
                 let p = Packet::decode(&raw, compression)?;
@@ -565,12 +565,12 @@ async fn session(
                             .receive(&p, compression, &profile, || backend.forwarding(&profile))?
                         {
                             LoginStep::Compression(threshold) => {
-                                wire::write_frame(&mut cw, &raw).await?;
+                                protocol::write_frame(&mut cw, &raw).await?;
                                 compression = Some(threshold);
                                 continue;
                             }
                             LoginStep::Reply(reply) => {
-                                wire::write_packet(&mut bw, reply, compression).await?;
+                                protocol::write_packet(&mut bw, reply, compression).await?;
                                 continue;
                             }
                             LoginStep::Ready => stage = Stage::LoginAck,
@@ -581,24 +581,24 @@ async fn session(
                         ensure!(p.body.is_empty(), "invalid finish configuration");
                         stage = Stage::ConfigurationAck;
                     }
-                    Stage::Play if p.id == wire::PLAY_RECONFIGURE => {
+                    Stage::Play if p.id == protocol::PLAY_RECONFIGURE => {
                         ensure!(p.body.is_empty(), "invalid start configuration");
                         stage = Stage::ReconfigurationAck;
                         started = Instant::now();
                     }
-                    Stage::Play if p.id == wire::PLAY_KEEPALIVE => {
+                    Stage::Play if p.id == protocol::PLAY_KEEPALIVE => {
                         ensure!(p.body.len() == 8, "invalid keepalive");
                         keepalive = Some((p.body.clone(), Instant::now()));
                     }
-                    Stage::Play if p.id == wire::PLAY_TRANSFER => {
+                    Stage::Play if p.id == protocol::PLAY_TRANSFER => {
                         bail!("backend attempted unmanaged transfer")
                     }
-                    Stage::Configuration if p.id == wire::CONFIGURATION_TRANSFER => {
+                    Stage::Configuration if p.id == protocol::CONFIGURATION_TRANSFER => {
                         bail!("backend attempted unmanaged transfer")
                     }
                     _ => {}
                 }
-                wire::write_frame(&mut cw, &raw).await?;
+                protocol::write_frame(&mut cw, &raw).await?;
             }
         }
     }

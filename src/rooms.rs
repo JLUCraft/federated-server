@@ -1,6 +1,6 @@
 //! Member-owned rooms: local instance lifecycle and delegated game admission.
+use crate::protocol::{self, Fields, Packet};
 use crate::skins::SkinSite;
-use crate::wire::{self, Fields, Packet};
 use anyhow::{Context, Result, ensure};
 use minecraftd::{
     core::{event::TokioBroadcastBus, state::InstanceState},
@@ -387,7 +387,7 @@ async fn bridge(
         .context("member has no verified game profile")?;
     let mut client = session.stream.compat();
     let (handshake, login) = timeout(CONNECT_TIMEOUT, async {
-        let handshake = wire::read_frame(&mut client).await?;
+        let handshake = protocol::read_frame(&mut client).await?;
         let packet = Packet::decode(&handshake, None)?;
         ensure!(packet.id == 0, "handshake required");
         let mut fields = Fields::new(&packet.body);
@@ -403,7 +403,7 @@ async fn bridge(
                 version >= MIN_UUID_LOGIN_PROTOCOL,
                 "Minecraft 1.20.2 or later required"
             );
-            let raw = wire::read_frame(&mut client).await?;
+            let raw = protocol::read_frame(&mut client).await?;
             let packet = Packet::decode(&raw, None)?;
             ensure!(packet.id == 0, "login start required");
             let mut fields = Fields::new(&packet.body);
@@ -432,7 +432,7 @@ async fn bridge(
     .await??;
     let mut remote = timeout(CONNECT_TIMEOUT, TcpStream::connect(backend)).await??;
     remote.set_nodelay(true)?;
-    wire::write_frame(&mut remote, &handshake).await?;
+    protocol::write_frame(&mut remote, &handshake).await?;
     if let Some((login, profile)) = login {
         let profile = crate::forwarding::Profile {
             textures: match skin_site {
@@ -441,32 +441,32 @@ async fn bridge(
             },
             ..profile
         };
-        wire::write_frame(&mut remote, &login).await?;
+        protocol::write_frame(&mut remote, &login).await?;
         // Complete and verify backend identity forwarding before exposing login success.
         timeout(CONNECT_TIMEOUT, async {
             let mut compression = None;
             let mut negotiation = crate::forwarding::LoginNegotiation::default();
             loop {
-                let raw = wire::read_frame(&mut remote).await?;
+                let raw = protocol::read_frame(&mut remote).await?;
                 let packet = Packet::decode(&raw, compression)?;
                 use crate::forwarding::LoginStep;
                 match negotiation.receive(&packet, compression, &profile, || {
                     crate::forwarding::encode(secret, &profile)
                 })? {
                     LoginStep::Compression(threshold) => {
-                        wire::write_frame(&mut client, &raw).await?;
+                        protocol::write_frame(&mut client, &raw).await?;
                         compression = Some(threshold);
                     }
                     LoginStep::Reply(reply) => {
-                        wire::write_packet(&mut remote, reply, compression).await?
+                        protocol::write_packet(&mut remote, reply, compression).await?
                     }
                     LoginStep::Ready => {
-                        wire::write_frame(&mut client, &raw).await?;
+                        protocol::write_frame(&mut client, &raw).await?;
                         return Ok::<_, anyhow::Error>(());
                     }
                     LoginStep::Forward => {
                         ensure!(packet.id != 0, "backend rejected member login");
-                        wire::write_frame(&mut client, &raw).await?;
+                        protocol::write_frame(&mut client, &raw).await?;
                     }
                 }
             }

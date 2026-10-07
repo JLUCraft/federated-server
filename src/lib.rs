@@ -4,10 +4,10 @@ mod bearer;
 pub mod forwarding;
 pub mod native;
 pub mod ops;
+pub mod protocol;
 pub mod rooms;
 pub mod scoring;
 pub mod skins;
-pub mod wire;
 
 pub use node::{Error, Result};
 

@@ -10,23 +10,23 @@ async fn paper_connection(
     secret: Vec<u8>,
     profiles: Vec<Profile>,
 ) -> Result<()> {
-    let handshake = Packet::decode(&wire::read_frame(&mut stream).await?, None)?;
+    let handshake = Packet::decode(&protocol::read_frame(&mut stream).await?, None)?;
     let mut f = Fields::new(&handshake.body);
-    assert_eq!(f.int()?, wire::VERSION);
+    assert_eq!(f.int()?, protocol::VERSION);
     f.text(255)?;
     f.bytes(2)?;
     let intention = f.int()?;
     if intention == 1 {
-        wire::read_frame(&mut stream).await?;
+        protocol::read_frame(&mut stream).await?;
         let mut body = vec![];
-        wire::string(
-            &serde_json::json!({"version":{"protocol":wire::VERSION}}).to_string(),
+        protocol::string(
+            &serde_json::json!({"version":{"protocol":protocol::VERSION}}).to_string(),
             &mut body,
         )?;
-        wire::write_packet(&mut stream, Packet { id: 0, body }, None).await?;
+        protocol::write_packet(&mut stream, Packet { id: 0, body }, None).await?;
         return Ok(());
     }
-    let login = Packet::decode(&wire::read_frame(&mut stream).await?, None)?;
+    let login = Packet::decode(&protocol::read_frame(&mut stream).await?, None)?;
     assert_eq!(login.id, 0);
     let mut identity = Fields::new(&login.body);
     let name = identity.text(16)?;
@@ -36,11 +36,11 @@ async fn paper_connection(
         .find(|p| p.uuid == uuid && p.name == name)
         .ok_or_else(|| anyhow::anyhow!("unexpected backend profile"))?;
     let mut query = vec![];
-    wire::varint(u32::MAX, &mut query);
-    wire::string("velocity:player_info", &mut query)?;
+    protocol::varint(u32::MAX, &mut query);
+    protocol::string("velocity:player_info", &mut query)?;
     query.push(4);
-    wire::write_packet(&mut stream, Packet { id: 4, body: query }, None).await?;
-    let response = Packet::decode(&wire::read_frame(&mut stream).await?, None)?;
+    protocol::write_packet(&mut stream, Packet { id: 4, body: query }, None).await?;
+    let response = Packet::decode(&protocol::read_frame(&mut stream).await?, None)?;
     assert_eq!(response.id, 2);
     let mut f = Fields::new(&response.body);
     assert_eq!(f.int()?, -1);
@@ -54,8 +54,8 @@ async fn paper_connection(
     assert_eq!(f.bytes(16)?, profile.uuid.as_bytes());
     assert_eq!(f.text(16)?, profile.name);
     let mut compression = vec![];
-    wire::varint(128, &mut compression);
-    wire::write_packet(
+    protocol::varint(128, &mut compression);
+    protocol::write_packet(
         &mut stream,
         Packet {
             id: 3,
@@ -65,14 +65,14 @@ async fn paper_connection(
     )
     .await?;
     let mut body = profile.uuid.as_bytes().to_vec();
-    wire::string(&profile.name, &mut body)?;
-    wire::varint(0, &mut body);
-    wire::write_packet(&mut stream, Packet { id: 2, body }, Some(128)).await?;
+    protocol::string(&profile.name, &mut body)?;
+    protocol::varint(0, &mut body);
+    protocol::write_packet(&mut stream, Packet { id: 2, body }, Some(128)).await?;
     assert_eq!(
-        Packet::decode(&wire::read_frame(&mut stream).await?, Some(128))?.id,
+        Packet::decode(&protocol::read_frame(&mut stream).await?, Some(128))?.id,
         3
     );
-    wire::write_packet(
+    protocol::write_packet(
         &mut stream,
         Packet {
             id: 3,
@@ -82,11 +82,11 @@ async fn paper_connection(
     )
     .await?;
     assert_eq!(
-        Packet::decode(&wire::read_frame(&mut stream).await?, Some(128))?.id,
+        Packet::decode(&protocol::read_frame(&mut stream).await?, Some(128))?.id,
         3
     );
     // A play packet larger than the compression threshold exercises actual zlib.
-    wire::write_packet(
+    protocol::write_packet(
         &mut stream,
         Packet {
             id: 1,
@@ -95,7 +95,7 @@ async fn paper_connection(
         Some(128),
     )
     .await?;
-    let _closed = wire::read_frame(&mut stream).await;
+    let _closed = protocol::read_frame(&mut stream).await;
     Ok(())
 }
 async fn proxy_session(address: std::net::SocketAddr, session: IncomingSession) -> Result<()> {
@@ -151,18 +151,18 @@ async fn room_host(
     Ok((node, backend, task))
 }
 async fn login(stream: &mut Connection, profile: &Profile) -> Result<()> {
-    wire::write_packet(stream, handshake("127.0.0.1", 25566, 2)?, None).await?;
+    protocol::write_packet(stream, handshake("127.0.0.1", 25566, 2)?, None).await?;
     let mut body = vec![];
-    wire::string(&profile.name, &mut body)?;
+    protocol::string(&profile.name, &mut body)?;
     body.extend(profile.uuid.as_bytes());
-    wire::write_packet(stream, Packet { id: 0, body }, None).await?;
-    let compression = Packet::decode(&wire::read_frame(stream).await?, None)?;
+    protocol::write_packet(stream, Packet { id: 0, body }, None).await?;
+    let compression = Packet::decode(&protocol::read_frame(stream).await?, None)?;
     assert_eq!(compression.id, 3);
     assert_eq!(
-        Packet::decode(&wire::read_frame(stream).await?, Some(128))?.id,
+        Packet::decode(&protocol::read_frame(stream).await?, Some(128))?.id,
         2
     );
-    wire::write_packet(
+    protocol::write_packet(
         stream,
         Packet {
             id: 3,
@@ -172,10 +172,10 @@ async fn login(stream: &mut Connection, profile: &Profile) -> Result<()> {
     )
     .await?;
     assert_eq!(
-        Packet::decode(&wire::read_frame(stream).await?, Some(128))?.id,
+        Packet::decode(&protocol::read_frame(stream).await?, Some(128))?.id,
         3
     );
-    wire::write_packet(
+    protocol::write_packet(
         stream,
         Packet {
             id: 3,
@@ -184,13 +184,13 @@ async fn login(stream: &mut Connection, profile: &Profile) -> Result<()> {
         Some(128),
     )
     .await?;
-    let play = Packet::decode(&wire::read_frame(stream).await?, Some(128))?;
+    let play = Packet::decode(&protocol::read_frame(stream).await?, Some(128))?;
     assert_eq!(play.body, vec![9; 512]);
     Ok(())
 }
 async fn transfer(stream: &mut Connection) -> Result<()> {
-    let packet = Packet::decode(&wire::read_frame(stream).await?, Some(128))?;
-    assert_eq!(packet.id, wire::PLAY_TRANSFER);
+    let packet = Packet::decode(&protocol::read_frame(stream).await?, Some(128))?;
+    assert_eq!(packet.id, protocol::PLAY_TRANSFER);
     let mut f = Fields::new(&packet.body);
     assert_eq!(f.text(255)?, "127.0.0.1");
     assert_eq!(f.int()?, 25566);

@@ -1,5 +1,5 @@
 //! Paper's built-in authenticated identity forwarding, shared by both hosting modes.
-use crate::wire;
+use crate::protocol;
 use anyhow::{Result, ensure};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
@@ -61,20 +61,20 @@ pub fn read_secret(path: &Path) -> Result<String> {
 pub fn encode(path: &Path, profile: &Profile) -> Result<Vec<u8>> {
     let secret = read_secret(path)?;
     let mut data = vec![];
-    wire::varint(1, &mut data);
-    wire::string("127.0.0.1", &mut data)?;
+    protocol::varint(1, &mut data);
+    protocol::string("127.0.0.1", &mut data)?;
     data.extend(profile.uuid.as_bytes());
-    wire::string(&profile.name, &mut data)?;
+    protocol::string(&profile.name, &mut data)?;
     match &profile.textures {
-        None => wire::varint(0, &mut data),
+        None => protocol::varint(0, &mut data),
         Some(textures) => {
-            wire::varint(1, &mut data);
-            wire::string(TEXTURES_PROPERTY, &mut data)?;
-            wire::string(textures.value(), &mut data)?;
+            protocol::varint(1, &mut data);
+            protocol::string(TEXTURES_PROPERTY, &mut data)?;
+            protocol::string(textures.value(), &mut data)?;
             match textures.signature() {
                 Some(signature) => {
                     data.push(1);
-                    wire::string(signature, &mut data)?;
+                    protocol::string(signature, &mut data)?;
                 }
                 None => data.push(0),
             }
@@ -95,33 +95,33 @@ pub struct LoginNegotiation {
 pub enum LoginStep {
     Forward,
     Compression(usize),
-    Reply(wire::Packet),
+    Reply(protocol::Packet),
     Ready,
 }
 impl LoginNegotiation {
     pub fn receive(
         &mut self,
-        packet: &wire::Packet,
+        packet: &protocol::Packet,
         compression: Option<usize>,
         profile: &Profile,
         payload: impl FnOnce() -> Result<Vec<u8>>,
     ) -> Result<LoginStep> {
-        use wire::Fields;
+        use protocol::Fields;
         match packet.id {
-            wire::LOGIN_ENCRYPTION_REQUEST => {
+            protocol::LOGIN_ENCRYPTION_REQUEST => {
                 anyhow::bail!("backend encryption requested: configure Paper identity forwarding")
             }
-            wire::LOGIN_COMPRESSION => {
+            protocol::LOGIN_COMPRESSION => {
                 let mut fields = Fields::new(&packet.body);
                 let threshold = usize::try_from(fields.int()?)?;
                 fields.finish()?;
                 ensure!(
-                    compression.is_none() && threshold <= wire::MAX_PACKET,
+                    compression.is_none() && threshold <= protocol::MAX_PACKET,
                     "invalid compression negotiation"
                 );
                 Ok(LoginStep::Compression(threshold))
             }
-            wire::LOGIN_CUSTOM_QUERY => {
+            protocol::LOGIN_CUSTOM_QUERY => {
                 let mut fields = Fields::new(&packet.body);
                 let transaction = fields.int()?;
                 ensure!(
@@ -130,13 +130,13 @@ impl LoginNegotiation {
                 );
                 ensure!(fields.remaining() == [4], "unsupported forwarding version");
                 let mut body = Vec::new();
-                wire::varint(transaction as u32, &mut body);
+                protocol::varint(transaction as u32, &mut body);
                 body.push(1);
                 body.extend(payload()?);
                 self.forwarded = true;
-                Ok(LoginStep::Reply(wire::Packet { id: 2, body }))
+                Ok(LoginStep::Reply(protocol::Packet { id: 2, body }))
             }
-            wire::LOGIN_FINISHED => {
+            protocol::LOGIN_FINISHED => {
                 ensure!(self.forwarded, "backend did not verify identity forwarding");
                 let mut fields = Fields::new(&packet.body);
                 ensure!(
@@ -146,7 +146,7 @@ impl LoginNegotiation {
                 );
                 Ok(LoginStep::Ready)
             }
-            wire::LOGIN_START | wire::LOGIN_COOKIE_REQUEST => Ok(LoginStep::Forward),
+            protocol::LOGIN_START | protocol::LOGIN_COOKIE_REQUEST => Ok(LoginStep::Forward),
             _ => anyhow::bail!("unexpected backend login packet"),
         }
     }
@@ -178,7 +178,7 @@ mod tests {
             let mut expected = Hmac::<Sha256>::new_from_slice("s".repeat(32).as_bytes())?;
             expected.update(data);
             expected.verify_slice(mac)?;
-            let mut fields = wire::Fields::new(data);
+            let mut fields = protocol::Fields::new(data);
             assert_eq!(fields.int()?, 1);
             assert_eq!(fields.text(255)?, "127.0.0.1");
             assert_eq!(fields.bytes(16)?, profile.uuid.as_bytes());
@@ -206,8 +206,8 @@ mod tests {
         };
         let mut login = LoginNegotiation::default();
         let mut success = profile.uuid.as_bytes().to_vec();
-        wire::string(&profile.name, &mut success)?;
-        let success = wire::Packet {
+        protocol::string(&profile.name, &mut success)?;
+        let success = protocol::Packet {
             id: 2,
             body: success,
         };
@@ -217,9 +217,9 @@ mod tests {
                 .is_err()
         );
         let mut body = vec![0];
-        wire::string("velocity:player_info", &mut body)?;
+        protocol::string("velocity:player_info", &mut body)?;
         body.push(4);
-        let query = wire::Packet { id: 4, body };
+        let query = protocol::Packet { id: 4, body };
         assert!(matches!(
             login.receive(&query, None, &profile, || Ok(vec![1]))?,
             LoginStep::Reply(_)
@@ -240,7 +240,7 @@ mod tests {
             login.receive(&success, None, &profile, || Ok(vec![]))?,
             LoginStep::Ready
         ));
-        let compression = wire::Packet {
+        let compression = protocol::Packet {
             id: 3,
             body: vec![0],
         };

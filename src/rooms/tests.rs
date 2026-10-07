@@ -5,12 +5,12 @@ use tokio::{io::AsyncReadExt, net::TcpListener};
 
 fn login(profile: uuid::Uuid) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut handshake = vec![0];
-    wire::varint(777, &mut handshake);
-    wire::string("localhost", &mut handshake)?;
+    protocol::varint(777, &mut handshake);
+    protocol::string("localhost", &mut handshake)?;
     handshake.extend(25565u16.to_be_bytes());
-    wire::varint(2, &mut handshake);
+    protocol::varint(2, &mut handshake);
     let mut login = vec![0];
-    wire::string("Student", &mut login)?;
+    protocol::string("Student", &mut login)?;
     login.extend(profile.as_bytes());
     Ok((handshake, login))
 }
@@ -30,11 +30,11 @@ async fn managed_room_publishes_after_readiness_and_withdraws_on_stop() -> Resul
             while !ready.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
             let listener = TcpListener::bind(backend).await?;
             let (mut stream, _) = listener.accept().await?;
-            wire::read_frame(&mut stream).await?;
-            wire::read_frame(&mut stream).await?;
+            protocol::read_frame(&mut stream).await?;
+            protocol::read_frame(&mut stream).await?;
             let mut status = vec![0];
-            wire::string(r#"{"version":{"name":"26.3","protocol":777},"players":{"max":12,"online":0},"description":"room fixture"}"#, &mut status)?;
-            wire::write_frame(&mut stream, &status).await?;
+            protocol::string(r#"{"version":{"name":"26.3","protocol":777},"players":{"max":12,"online":0},"description":"room fixture"}"#, &mut status)?;
+            protocol::write_frame(&mut stream, &status).await?;
             // Keep the backend listener alive until this fixture is dropped.
             std::future::pending::<Result<()>>().await
         });
@@ -193,8 +193,8 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
                 tokio::spawn(async move { super::bridge(session, backend, &key, None).await });
             let mut stream = stream.compat();
             let (handshake, login) = login(uuid::Uuid::from_u128(to as u128 + 1))?;
-            wire::write_frame(&mut stream, &handshake).await?;
-            wire::write_frame(&mut stream, &login).await?;
+            protocol::write_frame(&mut stream, &handshake).await?;
+            protocol::write_frame(&mut stream, &login).await?;
             assert!(bridge.await?.is_err());
             assert!(
                 timeout(Duration::from_millis(50), listener.accept())
@@ -219,27 +219,27 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             let mut stream = stream.compat();
             let profile = uuid::Uuid::from_u128(from as u128 + 1);
             let (handshake, login) = login(profile)?;
-            wire::write_frame(&mut stream, &handshake).await?;
-            wire::write_frame(&mut stream, &login).await?;
+            protocol::write_frame(&mut stream, &handshake).await?;
+            protocol::write_frame(&mut stream, &login).await?;
             let (mut remote, _) = listener.accept().await?;
-            assert_eq!(wire::read_frame(&mut remote).await?, handshake);
-            assert_eq!(wire::read_frame(&mut remote).await?, login);
+            assert_eq!(protocol::read_frame(&mut remote).await?, handshake);
+            assert_eq!(protocol::read_frame(&mut remote).await?, login);
             // Paper uses an unrestricted signed int as the opaque transaction ID.
             let transaction = if from == 0 { i32::MIN } else { -1 };
             let mut query = vec![4];
-            wire::varint(transaction as u32, &mut query);
-            wire::string("velocity:player_info", &mut query)?;
+            protocol::varint(transaction as u32, &mut query);
+            protocol::string("velocity:player_info", &mut query)?;
             query.push(4);
-            wire::write_frame(&mut remote, &query).await?;
-            let reply = Packet::decode(&wire::read_frame(&mut remote).await?, None)?;
+            protocol::write_frame(&mut remote, &query).await?;
+            let reply = Packet::decode(&protocol::read_frame(&mut remote).await?, None)?;
             assert_eq!(reply.id, 2);
             assert_eq!(Fields::new(&reply.body).int()?, transaction);
             let mut success = vec![2];
             success.extend(profile.as_bytes());
-            wire::string("Student", &mut success)?;
+            protocol::string("Student", &mut success)?;
             success.push(0);
-            wire::write_frame(&mut remote, &success).await?;
-            assert_eq!(wire::read_frame(&mut stream).await?, success);
+            protocol::write_frame(&mut remote, &success).await?;
+            assert_eq!(protocol::read_frame(&mut stream).await?, success);
             drop((remote, stream));
             bridge.await??;
         }
