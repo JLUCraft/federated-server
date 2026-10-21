@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workspace/federated-server
+    steps:
+      # The server links the shared library crates and the game daemon through
+      # sibling paths, so CI reproduces the local workspace layout.
+      - uses: actions/checkout@v7
+        with:
+          path: workspace/federated-server
+
+      - uses: actions/checkout@v7
+        with:
+          repository: JLUCraft/union-core
+          path: workspace/union-core
+
+      - uses: actions/checkout@v7
+        with:
+          repository: JLUCraft/minecraftd
+          path: workspace/minecraftd
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: workspace/federated-server -> target
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
