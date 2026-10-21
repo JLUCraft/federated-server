@@ -254,7 +254,7 @@ impl LocalRoom {
                 }).await.context("instance start timed out")??;
                 timeout(START_TIMEOUT, async {
                     loop {
-                        if let Ok(ping) = minecraftd::minecraft::ping::ping_java_server(config.instance.backend, CONNECT_TIMEOUT).await {
+                        if let Ok(ping) = minecraftd::minecraft::ping::ping_java_server(&config.instance.backend.to_string(), CONNECT_TIMEOUT).await {
                             break Ok::<_, anyhow::Error>(ping);
                         }
                         ensure!(instance.state() == InstanceState::Running, "instance exited before readiness");
@@ -267,7 +267,7 @@ impl LocalRoom {
                 let member = current.member_for_device(&holder.to_string()).context("room host device revoked during startup")?;
                 ensure!(current.is_member(member, &school), "room host membership revoked during startup");
                 let metadata = RoomMetadata { school: school.clone(), version: ping.version,
-                    players_max: u32::try_from(ping.max_players)? };
+                    players_max: ping.max_players };
                 metadata.validate()?;
                 if stopping.try_recv().is_ok() { return Ok(()); }
                 node.publish(Service { id: service, name: config.name.clone(), protocol: ROOM_PROTOCOL.into(),

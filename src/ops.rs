@@ -244,9 +244,12 @@ async fn status(managed: &Managed) -> Result<OpsInstance> {
         InstanceState::Error(_) => OpsInstanceState::Error,
     };
     let ping = if state == OpsInstanceState::Running {
-        minecraftd::minecraft::ping::ping_java_server(managed.config.backend, PING_TIMEOUT)
-            .await
-            .ok()
+        minecraftd::minecraft::ping::ping_java_server(
+            &managed.config.backend.to_string(),
+            PING_TIMEOUT,
+        )
+        .await
+        .ok()
     } else {
         None
     };
@@ -254,16 +257,8 @@ async fn status(managed: &Managed) -> Result<OpsInstance> {
         id: managed.config.id.clone(),
         kind: managed.config.server.server_type.clone(),
         state,
-        players_online: ping
-            .as_ref()
-            .map(|p| u32::try_from(p.current_players))
-            .transpose()?
-            .unwrap_or_default(),
-        players_max: ping
-            .as_ref()
-            .map(|p| u32::try_from(p.max_players))
-            .transpose()?
-            .unwrap_or_default(),
+        players_online: ping.as_ref().map(|p| p.current_players).unwrap_or_default(),
+        players_max: ping.as_ref().map(|p| p.max_players).unwrap_or_default(),
         version: ping.as_ref().map(|p| p.version.clone()).unwrap_or_default(),
         description: ping.map(|p| p.description),
     })
