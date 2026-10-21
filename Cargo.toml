@@ -8,6 +8,9 @@ license = "GPL-3.0-only"
 repository = "https://github.com/JLUCraft/game-server"
 publish = false
 
+[package.metadata.cargo-machete]
+ignored = ["openssl"]
+
 [dependencies]
 base64 = "0.22"
 aes-gcm = "0.11"
@@ -63,3 +66,9 @@ required-features = ["server"]
 name = "acceptance-driver"
 path = "tests/support/acceptance/main.rs"
 required-features = ["server"]
+
+# web-push pulls ece, whose only crypto backend links OpenSSL. Build it from
+# source on the platforms that do not ship a usable OpenSSL toolkit so hosted
+# CI needs no extra setup.
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
