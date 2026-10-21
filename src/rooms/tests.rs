@@ -35,6 +35,8 @@ async fn managed_room_publishes_after_readiness_and_withdraws_on_stop() -> Resul
             let mut status = vec![0];
             protocol::string(r#"{"version":{"name":"26.3","protocol":777},"players":{"max":12,"online":0},"description":"room fixture"}"#, &mut status)?;
             protocol::write_frame(&mut stream, &status).await?;
+            let ping = protocol::read_frame(&mut stream).await?;
+            protocol::write_frame(&mut stream, &ping).await?;
             // Keep the backend listener alive until this fixture is dropped.
             std::future::pending::<Result<()>>().await
         });
