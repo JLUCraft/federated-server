@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["JLUCraft"]
 description = "Federated Minecraft service host: league authority, native protocol proxy and Paper scoring bridge"
 license = "GPL-3.0-only"
-repository = "https://github.com/JLUCraft/game-server"
+repository = "https://github.com/JLUCraft/federated-server"
 publish = false
 
 [package.metadata.cargo-machete]
