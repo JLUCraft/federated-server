@@ -15,7 +15,7 @@ ignored = ["openssl"]
 base64 = "0.22"
 aes-gcm = "0.11"
 state = { path = "../union-core/crates/state" }
-client = { path = "../union-core/crates/client", features = ["office", "documents"] }
+client = { path = "../union-core/crates/client", features = ["documents"] }
 events = { path = "../union-core/crates/events", features = ["documents"] }
 flows = { path = "../union-core/crates/flows" }
 llm-gateway = { path = "../union-core/crates/llm-gateway" }
@@ -28,7 +28,7 @@ serde_json = "1"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 subtle = "2"
-league = { path = "../union-core/crates/league", features = ["runtime"] }
+league = { path = "../union-core/crates/league" }
 authority = { path = "../union-core/crates/authority" }
 node = { path = "../union-core/crates/node" }
 identity = { path = "../union-core/crates/identity" }
@@ -54,7 +54,7 @@ tempfile = "3"
 
 [features]
 default = ["server"]
-server = ["league/consensus"]
+server = ["authority/consensus"]
 
 [[bin]]
 name = "federated-server"

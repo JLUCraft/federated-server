@@ -1,7 +1,12 @@
-mod audit;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use terminal_runtime::init_logging;
+
+/// Production identity roots are reviewed at build time and cannot be replaced by configuration.
+const FOUNDER_MANIFEST: &str = include_str!(env!(
+    "FOUNDER_MANIFEST",
+    "set FOUNDER_MANIFEST to the absolute path of the reviewed build manifest"
+));
 
 #[derive(Parser)]
 #[command(version, about = "Federated service host")]
@@ -82,11 +87,6 @@ enum Command {
         #[arg(long)]
         init: bool,
     },
-    /// Export or independently verify a local gateway ledger commitment.
-    Gateway {
-        #[command(subcommand)]
-        command: audit::Command,
-    },
     /// Start configured services on one shared node.
     Run {
         #[arg(long)]
@@ -101,7 +101,9 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
-    match Args::parse().command {
+    let args = Args::parse();
+    let genesis = federated_server::bootstrap::parse_genesis(FOUNDER_MANIFEST.as_bytes())?;
+    match args.command {
         Command::FetchDocument {
             config,
             address,
@@ -110,7 +112,7 @@ async fn main() -> Result<()> {
             hash,
             out,
         } => {
-            let config = federated_server::bootstrap::load(&config)?;
+            let config = federated_server::bootstrap::load(&config, &genesis)?;
             let bytes = client::documents::fetch(
                 identity::Identity::load(&config.node.key)?,
                 client::documents::Input {
@@ -124,7 +126,7 @@ async fn main() -> Result<()> {
             federated_server::bootstrap::write_new_bytes(&out, &bytes)?;
         }
         Command::ImportDocument { config, file } => {
-            let config = federated_server::bootstrap::load(&config)?;
+            let config = federated_server::bootstrap::load(&config, &genesis)?;
             let documents = config
                 .services
                 .documents
@@ -138,14 +140,14 @@ async fn main() -> Result<()> {
             ))?
         ),
         Command::SignDevice { key, record, out } => {
-            federated_server::bootstrap::sign_device(&key, &record, &out)?
+            federated_server::bootstrap::sign_device(&key, &genesis, &record, &out)?
         }
         Command::IdentityConfig { config, address } => {
-            let config = federated_server::bootstrap::load(&config)?;
+            let config = federated_server::bootstrap::load(&config, &genesis)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&federated_server::bootstrap::identity_config(
-                    &config, address
+                    &config, &genesis, address
                 )?)?
             );
         }
@@ -154,8 +156,11 @@ async fn main() -> Result<()> {
             serde_json::to_string_pretty(&federated_server::bootstrap::initialize_device(&out)?)?
         ),
         Command::Init { config } => {
-            let config = federated_server::bootstrap::load(&config)?;
-            println!("{}", federated_server::bootstrap::initialize(&config)?);
+            let config = federated_server::bootstrap::load(&config, &genesis)?;
+            println!(
+                "{}",
+                federated_server::bootstrap::initialize(&config, &genesis)?
+            );
         }
         Command::SignService {
             config,
@@ -163,22 +168,20 @@ async fn main() -> Result<()> {
             out,
         } => {
             federated_server::bootstrap::sign_service(
-                &federated_server::bootstrap::load(&config)?,
+                &federated_server::bootstrap::load(&config, &genesis)?,
+                &genesis,
                 &record,
                 &out,
             )?;
         }
         Command::Genesis => {
-            let genesis = federated_server::bootstrap::genesis()?;
             let pin = client::trust::TrustState::genesis_digest(&genesis)?;
             println!(
                 "{}",
                 serde_json::json!({"genesis":genesis,"genesis_hash":pin})
             );
         }
-        Command::Gateway { command } => audit::execute(command)?,
         Command::IdentityBridge { config, init } => {
-            let genesis = federated_server::bootstrap::genesis()?;
             let config = federated_server::identity_bridge::Config::load(&config)?;
             if init {
                 println!(
@@ -201,11 +204,11 @@ async fn main() -> Result<()> {
             }
         }
         Command::Check { config } => {
-            federated_server::bootstrap::load(&config)?;
+            federated_server::bootstrap::load(&config, &genesis)?;
             println!("configuration valid");
         }
         Command::Run { config } => {
-            let config = federated_server::bootstrap::load(&config)?;
+            let config = federated_server::bootstrap::load(&config, &genesis)?;
             let mut host = federated_server::runtime::Host::start(config).await?;
             println!("{}", serde_json::to_string(&host.status()?)?);
             #[cfg(unix)]

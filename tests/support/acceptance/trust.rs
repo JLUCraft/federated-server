@@ -157,9 +157,11 @@ pub async fn execute(command: Command) -> Result<()> {
 }
 async fn remote(cache: Cache, target: Target, record: Option<TrustRecord>) -> Result<()> {
     let log = tokio::sync::Mutex::new(cache.open()?);
-    let node = target.node().await?;
+    let node = target.node().await.context("dial identity target")?;
     let result = async {
-        client::trust::synchronize(&node, target.peer.parse()?, &log).await?;
+        client::trust::synchronize(&node, target.peer.parse()?, &log)
+            .await
+            .context("synchronize identity before append")?;
         if let Some(record) = record {
             let mut state = log.lock().await.state().clone();
             state.apply(&record)?;
@@ -168,11 +170,14 @@ async fn remote(cache: Cache, target: Target, record: Option<TrustRecord>) -> Re
                 target.peer.parse()?,
                 TrustRequest::Append { record },
             )
-            .await?;
+            .await
+            .context("append signed identity record")?;
             if let Some(error) = response.error {
                 anyhow::bail!("{error}");
             }
-            client::trust::synchronize(&node, target.peer.parse()?, &log).await?;
+            client::trust::synchronize(&node, target.peer.parse()?, &log)
+                .await
+                .context("synchronize identity after append")?;
             ensure!(
                 log.lock().await.state().checkpoint().sequence >= state.checkpoint().sequence,
                 "submitted identity record missing"

@@ -157,8 +157,8 @@ impl Bridge {
         })
     }
 }
-/// Explicit genesis parameter supports embedded use and isolated tests; the server entry point
-/// always supplies bootstrap::genesis(), with no external trust-root override.
+/// The caller provides the explicit trust root for embedded hosts and isolated tests.
+/// The server entry point passes its compiled root.
 pub fn router(config: Config, genesis: TrustGenesis) -> crate::Result<Router> {
     router_inner(config, genesis).map_err(crate::operation_error)
 }

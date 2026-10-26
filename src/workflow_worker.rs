@@ -1,10 +1,10 @@
-//! Host orchestration of committed office plans; external effects are reconciled on restart.
-use crate::runtime::Office;
+//! Host orchestration of committed organization plans; external effects are reconciled on restart.
+use crate::runtime::Application;
 use anyhow::{Context, Result, ensure};
 use authority::authority::Authority;
 use events::{
     EventAction as E, Phase,
-    workflows::{GameResource, Kind, OfficeAction as O, ReportStatus},
+    workflows::{GameResource, Kind, OrganizationAction as O, ReportStatus},
 };
 use flows::FlowAction as F;
 use identity::Identity;
@@ -15,45 +15,35 @@ use std::{path::PathBuf, time::Duration};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub key: PathBuf,
-    pub identity: PathBuf,
 }
 async fn apply(
-    a: &Authority<Office>,
+    a: &Authority<Application>,
     key: &Identity,
     action: F<events::EventsDomain>,
 ) -> Result<()> {
-    ensure!(a.effect_epoch().is_some(), "office leader unavailable");
+    ensure!(a.effect_epoch().is_some(), "application leader unavailable");
     a.apply(key, state::governance::Action::Domain(action))
         .await?;
     Ok(())
 }
-async fn action(a: &Authority<Office>, key: &Identity, action: E) -> Result<()> {
+async fn action(a: &Authority<Application>, key: &Identity, action: E) -> Result<()> {
     apply(a, key, F::Inner(action)).await
 }
-pub async fn serve(a: Authority<Office>, config: Config) -> Result<()> {
+pub async fn serve(a: Authority<Application>, config: Config) -> Result<()> {
     let key = Identity::load(&config.key)?;
-    let mut trust: client::trust::Config =
-        serde_json::from_slice(&std::fs::read(&config.identity)?)?;
-    if trust.log.is_relative() {
-        trust.log = config
-            .identity
-            .parent()
-            .context("identity config directory missing")?
-            .join(&trust.log);
-    }
     let mut watch = a.watch().await;
     loop {
         watch.borrow_and_update();
         if a.effect_epoch().is_some()
-            && let Err(error) = reconcile(&a, &key, &trust).await
+            && let Err(error) = reconcile(&a, &key).await
         {
-            tracing::warn!(%error,"office workflow reconciliation paused");
+            tracing::warn!(%error,"workflow reconciliation paused");
         }
-        tokio::select! {result=watch.changed()=>{result.context("office closed")?;},_=tokio::time::sleep(Duration::from_secs(5))=>{}}
+        tokio::select! {result=watch.changed()=>{result.context("application closed")?;},_=tokio::time::sleep(Duration::from_secs(5))=>{}}
     }
 }
 async fn generated_flow(
-    a: &Authority<Office>,
+    a: &Authority<Application>,
     key: &Identity,
     config: &events::workflows::Automation,
     action: O,
@@ -85,20 +75,16 @@ async fn generated_flow(
                     .as_str()
                     .context("missing workflow action")?,
             ),
-            payload: E::Office(action),
+            payload: E::Organization(action),
             input,
         },
     )
     .await
 }
-async fn reconcile(
-    a: &Authority<Office>,
-    key: &Identity,
-    trust: &client::trust::Config,
-) -> Result<()> {
+async fn reconcile(a: &Authority<Application>, key: &Identity) -> Result<()> {
     let snapshot = a.state(key.peer_id()).await?;
     let state = &snapshot.domain.inner;
-    let Some(config) = &state.office.automation else {
+    let Some(config) = &state.organization.automation else {
         return Ok(());
     };
     let core = snapshot.identity_core(a.identity_view().state()?.as_ref())?;
@@ -109,7 +95,7 @@ async fn reconcile(
         "workflow worker identity mismatch"
     );
     let now = authority::journal::now_ms()?;
-    for (id, p) in &state.office.plans {
+    for (id, p) in &state.organization.plans {
         if p.worker != config.worker {
             continue;
         }
@@ -131,11 +117,7 @@ async fn reconcile(
                 action(a, key, E::Submit { id: id.clone() }).await?;
             }
         } else if event.phase == Phase::Review {
-            let flow_id = format!(
-                "review-{}-{}",
-                node::protocol::digest(id.as_bytes()),
-                event.epoch
-            );
+            let flow_id = review_instance(&snapshot.domain, id, event.epoch);
             match snapshot.domain.flows.get(&flow_id) {
                 None => {
                     apply(
@@ -170,7 +152,7 @@ async fn reconcile(
             if p.kind == Kind::Online {
                 for game in &p.selected {
                     let resource = state
-                        .office
+                        .organization
                         .resources
                         .get(game)
                         .context("game resource missing")?;
@@ -181,7 +163,6 @@ async fn reconcile(
                     let result = game_step(
                         a,
                         key,
-                        trust,
                         id,
                         event,
                         p,
@@ -197,7 +178,7 @@ async fn reconcile(
                             action(
                                 a,
                                 key,
-                                E::Office(O::GameReceipt {
+                                E::Organization(O::GameReceipt {
                                     event: id.clone(),
                                     game: game.clone(),
                                     started: existing.is_some_and(|r| r.started),
@@ -225,7 +206,7 @@ async fn reconcile(
             }
         } else if event.phase == Phase::Done {
             if !p.settled {
-                action(a, key, E::Office(O::Settle { event: id.clone() })).await?;
+                action(a, key, E::Organization(O::Settle { event: id.clone() })).await?;
             } else if p.summary.is_none() {
                 generated_flow(
                     a,
@@ -245,7 +226,7 @@ async fn reconcile(
             tracing::warn!(%id,%error,"office plan awaiting recovery");
         }
     }
-    for (id, r) in &state.office.reports {
+    for (id, r) in &state.organization.reports {
         if r.worker == config.worker && r.status == ReportStatus::Generating {
             let result = generated_flow(
                 a,
@@ -264,26 +245,16 @@ async fn reconcile(
     }
     Ok(())
 }
-async fn league(
+async fn competition(
+    a: &Authority<Application>,
     key: &Identity,
-    trust: &client::trust::Config,
-    r: &GameResource,
-    action: Option<league::LeagueAction>,
-) -> Result<state::State<league::LeagueDomain>> {
-    let result = client::generic::execute(
-        key.clone(),
-        client::generic::Input::<league::LeagueDomain> {
-            identity: trust.clone(),
-            address: r.address.clone(),
-            peer: r.peer.clone(),
-            genesis_hash: r.genesis.clone(),
-            revision: None,
-            action: action.map(state::governance::Action::Domain),
-        },
-    )
-    .await?;
-    ensure!(result.error.is_none(), "league operation rejected");
-    result.state.context("league snapshot missing")
+    command: Option<league::LeagueAction>,
+) -> Result<client::application::Snapshot> {
+    if let Some(command) = command {
+        a.apply(key, client::application::competition(command))
+            .await?;
+    }
+    Ok(a.state(key.peer_id()).await?)
 }
 async fn ops(key: &Identity, r: &GameResource, op: OpsOp) -> Result<node::protocol::OpsResponse> {
     let node = node::Node::start(key.clone(), node::NodeConfig::default()).await?;
@@ -306,9 +277,8 @@ async fn ops(key: &Identity, r: &GameResource, op: OpsOp) -> Result<node::protoc
 }
 #[allow(clippy::too_many_arguments)]
 async fn game_step(
-    a: &Authority<Office>,
+    a: &Authority<Application>,
     key: &Identity,
-    trust: &client::trust::Config,
     id: &str,
     event: &events::Event,
     p: &events::workflows::Plan,
@@ -316,7 +286,7 @@ async fn game_step(
     r: &GameResource,
     checked: std::collections::BTreeSet<String>,
 ) -> Result<()> {
-    let epoch = a.effect_epoch().context("office leader unavailable")?;
+    let epoch = a.effect_epoch().context("application leader unavailable")?;
     let now = authority::journal::now_ms()?;
     let league_id = events::workflows::league_id(id, game);
     if event.phase == Phase::Cancelled {
@@ -327,7 +297,7 @@ async fn game_step(
         return action(
             a,
             key,
-            E::Office(O::GameReceipt {
+            E::Organization(O::GameReceipt {
                 event: id.into(),
                 game: game.into(),
                 started: p.games.get(game).is_some_and(|g| g.started),
@@ -339,13 +309,12 @@ async fn game_step(
         )
         .await;
     }
-    let mut snapshot = league(key, trust, r, None).await?;
+    let mut snapshot = competition(a, key, None).await?;
     if !snapshot.domain.leagues.contains_key(&league_id) {
         ensure_current(a, key, id, event, epoch).await?;
-        snapshot = league(
+        snapshot = competition(
+            a,
             key,
-            trust,
-            r,
             Some(league::LeagueAction::CreateLeague {
                 league: league_id.clone(),
                 rules: league::governance::Rules {
@@ -361,10 +330,9 @@ async fn game_step(
     }
     if !snapshot.domain.seasons.contains_key(id) {
         ensure_current(a, key, id, event, epoch).await?;
-        snapshot = league(
+        snapshot = competition(
+            a,
             key,
-            trust,
-            r,
             Some(league::LeagueAction::CreateSeason {
                 id: id.into(),
                 title: event.title.clone(),
@@ -374,10 +342,9 @@ async fn game_step(
     }
     if snapshot.domain.leagues[&league_id].schedule.is_none() {
         ensure_current(a, key, id, event, epoch).await?;
-        snapshot = league(
+        snapshot = competition(
+            a,
             key,
-            trust,
-            r,
             Some(league::LeagueAction::ScheduleLeague {
                 season: id.into(),
                 league: league_id.clone(),
@@ -395,7 +362,7 @@ async fn game_step(
         action(
             a,
             key,
-            E::Office(O::GameClaim {
+            E::Organization(O::GameClaim {
                 event: id.into(),
                 game: game.into(),
             }),
@@ -425,10 +392,9 @@ async fn game_step(
     {
         if snapshot.domain.leagues[&league_id].admitted.is_none() {
             ensure_current(a, key, id, event, epoch).await?;
-            league(
+            competition(
+                a,
                 key,
-                trust,
-                r,
                 Some(league::LeagueAction::SetAttendance {
                     league: league_id.clone(),
                     members: checked,
@@ -441,10 +407,9 @@ async fn game_step(
         let mut seed = [0; 32];
         seed.copy_from_slice(&digest.as_bytes()[..32]);
         ensure_current(a, key, id, event, epoch).await?;
-        snapshot = league(
+        snapshot = competition(
+            a,
             key,
-            trust,
-            r,
             Some(league::LeagueAction::Start {
                 league: league_id.clone(),
                 seed,
@@ -456,10 +421,9 @@ async fn game_step(
         && snapshot.domain.leagues[&league_id].phase == league::governance::Phase::Playing
     {
         ensure_current(a, key, id, event, epoch).await?;
-        snapshot = league(
+        snapshot = competition(
+            a,
             key,
-            trust,
-            r,
             Some(league::LeagueAction::Finish {
                 league: league_id.clone(),
             }),
@@ -469,7 +433,7 @@ async fn game_step(
     let league_state = &snapshot.domain.leagues[&league_id];
     if league_state.phase == league::governance::Phase::Finished {
         let bytes = serde_json::to_vec(
-            &serde_json::json!({"genesis":r.genesis,"revision":snapshot.revision,"league":league_state}),
+            &serde_json::json!({"genesis":a.genesis_hash().await,"revision":snapshot.revision,"league":league_state}),
         )?;
         let state = a.state(key.peer_id()).await?;
         let (evidence, blocks) = state.domain.inner.files.version(None, &bytes)?;
@@ -480,7 +444,7 @@ async fn game_step(
         action(
             a,
             key,
-            E::Office(O::GameReceipt {
+            E::Organization(O::GameReceipt {
                 event: id.into(),
                 game: game.into(),
                 started: true,
@@ -499,7 +463,7 @@ async fn game_step(
         action(
             a,
             key,
-            E::Office(O::GameReceipt {
+            E::Organization(O::GameReceipt {
                 event: id.into(),
                 game: game.into(),
                 started,
@@ -516,7 +480,7 @@ async fn game_step(
 
 /// Stop the league on the game server if that instance is currently running one.
 async fn stop_league_if_running(
-    a: &Authority<Office>,
+    a: &Authority<Application>,
     key: &Identity,
     id: &str,
     event: &events::Event,
@@ -551,7 +515,7 @@ async fn stop_league_if_running(
     Ok(())
 }
 async fn ensure_current(
-    a: &Authority<Office>,
+    a: &Authority<Application>,
     key: &Identity,
     id: &str,
     event: &events::Event,
@@ -588,5 +552,71 @@ fn automatic_stage(config: &events::workflows::Automation, purpose: &str) -> flo
         },
         timeout_ms: Some(config.timeout_ms),
         on_timeout: flows::TimeoutPolicy::Reject,
+    }
+}
+
+/// Reuse a submitted review, including a rejection that needs a new draft revision.
+fn review_instance(
+    state: &flows::FlowsState<events::EventsDomain>,
+    id: &str,
+    epoch: u64,
+) -> String {
+    state.flows.iter().find_map(|(flow_id, flow)| {
+        matches!(&flow.payload, E::Approve { id: target, epoch: version, .. } if target == id && *version == epoch)
+            .then(|| flow_id.clone())
+    }).unwrap_or_else(|| format!("review-{}-{epoch}", node::protocol::digest(id.as_bytes())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use authority::journal::Journal;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn competition_effects_advance_the_same_organization_authority() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let worker = Identity::generate();
+        let identities =
+            crate::test_identity::Identities::new(&[(&worker, "worker", "club")], "worker");
+        let genesis = identities.genesis::<Application>();
+        let view = identities.log.view(Duration::from_secs(60))?;
+        let journal = Journal::open(directory.path().join("application"), genesis)?;
+        let pin = journal.genesis_hash().to_owned();
+        let authority = Authority::Local {
+            journal: Arc::new(Mutex::new(journal)),
+            log: Arc::new(Mutex::new(identities.log)),
+            view,
+        };
+        authority
+            .apply(
+                &worker,
+                state::governance::Action::AnchorDigest {
+                    id: "before-game".into(),
+                    digest: "a".repeat(64),
+                },
+            )
+            .await?;
+        let snapshot = competition(
+            &authority,
+            &worker,
+            Some(league::LeagueAction::CreateLeague {
+                league: "game".into(),
+                rules: Default::default(),
+                host: worker.peer_id().to_string(),
+                scorer: worker.peer_id().to_string(),
+            }),
+        )
+        .await?;
+        assert_eq!(snapshot.revision, 2);
+        assert!(snapshot.digest_anchors.contains_key("before-game"));
+        assert!(snapshot.domain.leagues.contains_key("game"));
+        assert_eq!(authority.genesis_hash().await, pin);
+        assert_eq!(
+            competition(&authority, &worker, None).await?.revision,
+            snapshot.revision
+        );
+        Ok(())
     }
 }

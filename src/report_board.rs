@@ -1,5 +1,5 @@
 //! Anonymous report publication; only explicitly published document versions are exposed.
-use crate::runtime::Office;
+use crate::runtime::Application;
 use authority::authority::Authority;
 use axum::{
     Json, Router,
@@ -18,7 +18,7 @@ pub struct Config {
 }
 #[derive(Clone)]
 struct Board {
-    authority: Authority<Office>,
+    authority: Authority<Application>,
     identity: identity::PeerId,
 }
 #[derive(Deserialize)]
@@ -26,7 +26,7 @@ struct Page {
     after: Option<String>,
 }
 const PAGE_SIZE: usize = 50;
-pub async fn serve(authority: Authority<Office>, config: Config) -> anyhow::Result<()> {
+pub async fn serve(authority: Authority<Application>, config: Config) -> anyhow::Result<()> {
     let identity = identity::Identity::load(&config.key)?.peer_id();
     let app = Router::new()
         .route(
@@ -54,7 +54,7 @@ async fn list(
     let mut selected = state
         .domain
         .inner
-        .office
+        .organization
         .publications
         .iter()
         .filter(|(id, _)| page.after.as_ref().is_none_or(|a| *id > a))
@@ -85,7 +85,7 @@ async fn document(
     let report = state
         .domain
         .inner
-        .office
+        .organization
         .publications
         .get(&id)
         .ok_or(StatusCode::NOT_FOUND)?;

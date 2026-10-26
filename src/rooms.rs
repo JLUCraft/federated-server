@@ -171,6 +171,7 @@ impl LocalRoom {
         incoming: tokio::sync::mpsc::Receiver<IncomingSession>,
         config: HostConfig,
         view: authority::trust::TrustView,
+        witnesses: Option<crate::activity::Witnesses>,
     ) -> crate::Result<Self> {
         let settings = RoomSettings {
             service: config.service,
@@ -186,6 +187,7 @@ impl LocalRoom {
             view,
             config.club,
             config.join_clubs,
+            witnesses,
         )
         .await
         .map_err(crate::operation_error)
@@ -197,6 +199,7 @@ impl LocalRoom {
         mut identity_view: authority::trust::TrustView,
         school: String,
         clubs: std::collections::BTreeSet<String>,
+        witnesses: Option<crate::activity::Witnesses>,
     ) -> Result<Self> {
         config.instance.validate()?;
         validate_backend(&config.instance)?;
@@ -295,8 +298,9 @@ impl LocalRoom {
                             let backend = config.instance.backend;
                             let secret = forwarding_secret.clone();
                             let skin = skin_site.clone();
+                            let witnesses=witnesses.clone();
                             tasks.spawn(async move {
-                                if let Err(error) = bridge(session, backend, &secret, skin.as_ref().as_ref()).await {
+                                if let Err(error) = bridge(session, backend, &secret, skin.as_ref().as_ref(), witnesses).await {
                                     tracing::debug!(%error, "room session ended");
                                 }
                             });
@@ -375,6 +379,7 @@ async fn bridge(
     backend: SocketAddr,
     secret: &std::path::Path,
     skin_site: Option<&SkinSite>,
+    witnesses: Option<crate::activity::Witnesses>,
 ) -> Result<()> {
     let claims = session
         .claims
@@ -385,6 +390,8 @@ async fn bridge(
         .game_profile
         .as_deref()
         .context("member has no verified game profile")?;
+    let service = session.service.to_string();
+    let mut witness = None;
     let mut client = session.stream.compat();
     let (handshake, login) = timeout(CONNECT_TIMEOUT, async {
         let handshake = protocol::read_frame(&mut client).await?;
@@ -472,7 +479,23 @@ async fn bridge(
             }
         })
         .await??;
+        if let Some(witnesses) = witnesses {
+            match witnesses.begin(
+                &service,
+                &profile.uuid.simple().to_string(),
+                &admission.member,
+                &session.peer.to_string(),
+                admission.clubs,
+            ) {
+                Ok(guard) => witness = Some(guard),
+                Err(error) => tracing::warn!(%error,"activity witness unavailable"),
+            }
+        }
     }
+    let mut client = crate::activity::Witnessed {
+        stream: client,
+        witness,
+    };
     tokio::io::copy_bidirectional(&mut client, &mut remote).await?;
     Ok(())
 }

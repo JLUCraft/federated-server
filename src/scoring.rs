@@ -5,8 +5,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use client::application::Action;
 use identity::Identity;
-use league::governance::{Action, Phase};
+use league::governance::Phase;
 use serde::Deserialize;
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 #[cfg(test)]
@@ -14,7 +15,7 @@ use tokio::sync::Mutex;
 
 #[derive(Clone)]
 struct Context {
-    journal: league::authority::Authority,
+    journal: client::application::Authority,
     identity: Identity,
     token: Arc<Vec<u8>>,
 }
@@ -45,7 +46,10 @@ async fn apply(
         .state(context.identity.peer_id())
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    if let Action::Domain(league::LeagueAction::Finish { league }) = &action {
+    if let Action::Domain(flows::FlowAction::Inner(events::EventAction::Competition(
+        league::LeagueAction::Finish { league },
+    ))) = &action
+    {
         let league = journal
             .domain
             .leagues
@@ -104,7 +108,7 @@ async fn session(
 }
 pub async fn serve(
     address: SocketAddr,
-    journal: league::authority::Authority,
+    journal: client::application::Authority,
     identity: Identity,
     token: String,
 ) -> anyhow::Result<()> {
@@ -130,7 +134,7 @@ pub async fn serve(
                     apply(
                         c,
                         h,
-                        Action::Domain(league::LeagueAction::Score {
+                        client::application::competition(league::LeagueAction::Score {
                             league: s.league,
                             event: s.event,
                             players: s.players,
@@ -148,7 +152,9 @@ pub async fn serve(
                     apply(
                         c,
                         h,
-                        Action::Domain(league::LeagueAction::Finish { league: s.league }),
+                        client::application::competition(league::LeagueAction::Finish {
+                            league: s.league,
+                        }),
                     )
                     .await
                 },
@@ -163,7 +169,7 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use league::journal::{Journal, now_ms};
+    use authority::journal::{Journal, now_ms};
     #[tokio::test]
     async fn scoring_only_identity_and_bearer_cannot_manage_the_league() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -177,13 +183,13 @@ mod tests {
         let mut journal = Journal::open(directory.path().join("journal"), ids.genesis())?;
         let now = now_ms()?;
         for action in [
-            Action::Domain(league::LeagueAction::CreateLeague {
+            client::application::competition(league::LeagueAction::CreateLeague {
                 league: "cup".into(),
                 rules: Default::default(),
                 host: admin.peer_id().to_string(),
                 scorer: scorer.peer_id().to_string(),
             }),
-            Action::Domain(league::LeagueAction::Start {
+            client::application::competition(league::LeagueAction::Start {
                 league: "cup".into(),
                 seed: [0; 32],
             }),
@@ -192,7 +198,7 @@ mod tests {
         }
         let journal = Arc::new(Mutex::new(journal));
         let context = Context {
-            journal: league::authority::Authority::Local {
+            journal: client::application::Authority::Local {
                 journal: journal.clone(),
                 log: Arc::new(Mutex::new(ids.log)),
                 view,
@@ -205,7 +211,7 @@ mod tests {
             apply(
                 context.clone(),
                 headers.clone(),
-                Action::Domain(league::LeagueAction::Finish {
+                client::application::competition(league::LeagueAction::Finish {
                     league: "cup".into()
                 })
             )
@@ -233,7 +239,7 @@ mod tests {
             apply(
                 context.clone(),
                 headers.clone(),
-                Action::Domain(league::LeagueAction::Finish {
+                client::application::competition(league::LeagueAction::Finish {
                     league: "cup".into()
                 })
             )
@@ -244,7 +250,7 @@ mod tests {
             apply(
                 context,
                 headers,
-                Action::Domain(league::LeagueAction::Finish {
+                client::application::competition(league::LeagueAction::Finish {
                     league: "cup".into()
                 })
             )

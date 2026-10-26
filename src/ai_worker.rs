@@ -1,5 +1,5 @@
 //! Automatic, serial execution of committed AI stages. Model I/O never runs in replay.
-use crate::runtime::Office;
+use crate::runtime::Application;
 use anyhow::{Context, Result, bail};
 use authority::authority::Authority;
 use authority::journal::now_ms;
@@ -12,37 +12,68 @@ type F = flows::FlowAction<events::EventsDomain>;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub key: PathBuf,
-    #[serde(default)]
-    pub address: String,
-    #[serde(default)]
-    pub peer: String,
-    #[serde(default)]
-    pub service: String,
+    pub providers: Vec<llm_gateway::Provider>,
+    #[serde(default = "llm_gateway::default_concurrency")]
+    pub concurrency: usize,
 }
-async fn apply(authority: &Authority<Office>, identity: &Identity, action: F) -> Result<()> {
+
+pub(crate) struct Prepared {
+    identity: Identity,
+    providers: llm_gateway::Gateway,
+}
+pub(crate) fn prepare(config: Config) -> Result<Prepared> {
+    Ok(Prepared {
+        identity: Identity::load(&config.key)?,
+        providers: llm_gateway::Gateway::new(llm_gateway::Config {
+            providers: config.providers,
+            concurrency: config.concurrency,
+        })?,
+    })
+}
+async fn apply(authority: &Authority<Application>, identity: &Identity, action: F) -> Result<()> {
     authority
         .apply(identity, state::governance::Action::Domain(action))
         .await?;
     Ok(())
 }
-pub async fn serve(authority: Authority<Office>, config: Config) -> Result<()> {
+pub(crate) async fn serve(authority: Authority<Application>, prepared: Prepared) -> Result<()> {
     let unified = authority.identity_view();
-    let identity = Identity::load(&config.key)?;
+    let Prepared {
+        identity,
+        providers,
+    } = prepared;
     let device = identity.peer_id().to_string();
     let mut updates = authority.watch().await;
     let mut identity_updates = unified.clone();
-    let mut recovered_epoch = None;
+    let mut recovered = false;
     loop {
-        let Some(epoch) = authority.effect_epoch() else {
-            wait_updates(&mut updates, &mut identity_updates).await?;
-            continue;
-        };
-        if recovered_epoch != Some(epoch) {
+        if !recovered {
             if recover(&authority, &identity).await.is_err() {
                 wait_updates(&mut updates, &mut identity_updates).await?;
                 continue;
             }
-            recovered_epoch = Some(epoch);
+            let snapshot = authority.state(identity.peer_id()).await?;
+            let core = effective_core(&snapshot, &unified)?;
+            let worker = core
+                .members
+                .iter()
+                .find(|(_, m)| m.owns(&device))
+                .map(|(id, _)| id)
+                .context("AI worker is not a member")?;
+            let models = providers.models();
+            let existing = snapshot.domain.ai_workers.get(worker);
+            if existing.is_none_or(|w| w.models != models) {
+                apply(
+                    &authority,
+                    &identity,
+                    F::AiWorker {
+                        models,
+                        active: existing.is_none_or(|w| w.active),
+                    },
+                )
+                .await?;
+            }
+            recovered = true;
         }
         identity_updates.mark_seen();
         updates.borrow_and_update();
@@ -99,6 +130,7 @@ pub async fn serve(authority: Authority<Office>, config: Config) -> Result<()> {
                     .filter_map(|id| flows::ai_job(&state.domain, id).ok().flatten())
                     .find(|job| {
                         Some(&job.worker) == worker
+                            && providers.supports(&job.model)
                             && state.domain.flows[&job.instance]
                                 .deadline_ms
                                 .is_none_or(|t| now_ms().is_ok_and(|now| now < t))
@@ -126,12 +158,13 @@ pub async fn serve(authority: Authority<Office>, config: Config) -> Result<()> {
             wait_updates(&mut updates, &mut identity_updates).await?;
             continue;
         }
-        let result = execute(&authority, &config, &identity, &job, &unified).await;
-        let (output, error) = match result {
-            Ok(cid) => (Some(cid), None),
+        let result = execute(&authority, &providers, &identity, &job, &unified).await;
+        let (output, usage, error) = match result {
+            Ok((cid, usage)) => (Some(cid), Some(usage), None),
             Err(_) => (
                 None,
-                Some("AI execution failed; inspect executor configuration or retry".into()),
+                None,
+                Some("AI execution failed; inspect provider configuration or retry".into()),
             ),
         };
         // A cancelled, expired, replaced or revoked task must never advance.
@@ -139,17 +172,26 @@ pub async fn serve(authority: Authority<Office>, config: Config) -> Result<()> {
             &authority,
             &identity,
             F::FinishAi {
-                instance: job.instance,
+                instance: job.instance.clone(),
                 job: job.job,
                 attempt: job.attempt,
                 output,
+                usage,
                 error,
+            },
+        )
+        .await;
+        let _ = apply(
+            &authority,
+            &identity,
+            F::Execute {
+                instance: job.instance,
             },
         )
         .await;
     }
 }
-async fn recover(authority: &Authority<Office>, identity: &Identity) -> Result<()> {
+async fn recover(authority: &Authority<Application>, identity: &Identity) -> Result<()> {
     let device = identity.peer_id().to_string();
     // A crash may leave an externally billed call without a committed receipt.
     // Record it as failed; explicit retry creates a new attempt instead of silently rebilling.
@@ -179,6 +221,7 @@ async fn recover(authority: &Authority<Office>, identity: &Identity) -> Result<(
                     job,
                     attempt,
                     output: None,
+                    usage: None,
                     error: Some("executor interrupted; retry required".into()),
                 },
             )
@@ -188,13 +231,12 @@ async fn recover(authority: &Authority<Office>, identity: &Identity) -> Result<(
     Ok(())
 }
 async fn execute(
-    authority: &Authority<Office>,
-    config: &Config,
+    authority: &Authority<Application>,
+    providers: &llm_gateway::Gateway,
     identity: &Identity,
     job: &flows::AiJob,
     unified: &authority::trust::TrustView,
-) -> Result<client::protocol::Cid> {
-    let epoch = authority.effect_epoch().context("executor is not leader")?;
+) -> Result<(client::protocol::Cid, client::protocol::LlmUsage)> {
     let snapshot = authority.state(identity.peer_id()).await?;
     let input = snapshot.domain.inner.files.read(&job.input)?;
     let (attachments, required_capabilities) =
@@ -204,25 +246,17 @@ async fn execute(
         &serde_json::json!({"task":job.purpose,"mode":job.mode,"job":job.job,"input":job.input,"material":content}),
     )?;
     let mut updates = authority.watch().await;
-    let request = client::llm::execute(
-        identity.clone(),
-        client::llm::Input {
-            address: config.address.clone(),
-            peer: config.peer.clone(),
-            service: config.service.clone(),
-            request: client::protocol::LlmRequest {
-                attachments,
-                required_capabilities,
-                model: job.model.clone(),
-                purpose: job.purpose.clone(),
-                privacy: job.privacy,
-                messages: vec![],
-                context: Some(context),
-                stream: true,
-                max_tokens: job.max_tokens,
-            },
-        },
-    );
+    let request = providers.complete(client::protocol::LlmRequest {
+        attachments,
+        required_capabilities,
+        model: job.model.clone(),
+        purpose: job.purpose.clone(),
+        privacy: job.privacy,
+        messages: vec![],
+        context: Some(context),
+        stream: true,
+        max_tokens: job.max_tokens,
+    });
     tokio::pin!(request);
     let mut identity_updates = unified.clone();
     let completion = loop {
@@ -230,8 +264,7 @@ async fn execute(
         updates.borrow_and_update();
         {
             let state = authority.state(identity.peer_id()).await?;
-            if authority.effect_epoch() != Some(epoch) || !running(&state, identity, job, unified)?
-            {
+            if !running(&state, identity, job, unified)? {
                 bail!("AI stage cancelled or revoked");
             }
         }
@@ -242,12 +275,12 @@ async fn execute(
             _=tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
         }
     };
-    if completion.truncated || completion.error.is_some() || completion.content.is_empty() {
+    if completion.truncated || completion.content.is_empty() {
         bail!("incomplete model output");
     }
     flows::validate_ai_output(job.mode, completion.content.as_bytes())?;
     let state = authority.state(identity.peer_id()).await?;
-    if authority.effect_epoch() != Some(epoch) || !running(&state, identity, job, unified)? {
+    if !running(&state, identity, job, unified)? {
         bail!("AI stage changed");
     }
     let (cid, blocks) = state
@@ -263,11 +296,11 @@ async fn execute(
         )
         .await?;
     }
-    Ok(cid)
+    Ok((cid, completion.usage))
 }
 
 fn running(
-    state: &state::State<Office>,
+    state: &state::State<Application>,
     identity: &Identity,
     job: &flows::AiJob,
     unified: &authority::trust::TrustView,
@@ -279,6 +312,26 @@ fn running(
     {
         let current = unified.state()?;
         if !state.can_write(&device, &current) {
+            return Ok(false);
+        }
+    }
+    if flow.allowance.is_some() {
+        let expected = <events::EventsDomain as state::Domain>::workflow_input(
+            &state.domain.inner,
+            &flow.payload,
+        );
+        let actual = <events::EventsDomain as state::Domain>::artifact(
+            &state.domain.inner,
+            &job.input.to_string(),
+        );
+        if <events::EventsDomain as state::Domain>::workflow_worker(
+            &state.domain.inner,
+            &flow.payload,
+        )
+        .as_deref()
+            != Some(job.worker.as_str())
+            || !matches!((expected,actual),(Ok(expected),Ok(actual)) if expected==actual)
+        {
             return Ok(false);
         }
     }
@@ -323,13 +376,13 @@ async fn wait_updates(
 }
 
 fn effective_core(
-    state: &state::State<Office>,
+    state: &state::State<Application>,
     unified: &authority::trust::TrustView,
 ) -> Result<state::governance::CoreState> {
     Ok(state.identity_core(unified.state()?.as_ref())?)
 }
 #[cfg(test)]
-#[path = "office_ai_tests.rs"]
+#[path = "ai_worker_tests.rs"]
 mod tests;
 
 fn document_attachments(

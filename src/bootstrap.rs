@@ -1,24 +1,42 @@
-//! Deployment trust root. The shared runtime remains usable by embedded hosts and tests.
-use crate::runtime::{Config, Domain, Office};
+//! Explicit trust-root validation, initialization, and possession signing.
+use crate::runtime::{Application, Config};
 use client::trust::{TrustGenesis, TrustState};
 use node::{Error, Identity, Result};
 use std::{io::Write, path::Path};
 
-/// Sole production founder manifest. No runtime file or environment override.
-pub fn genesis() -> Result<TrustGenesis> {
-    let genesis: TrustGenesis = serde_json::from_str(include_str!("founders.json"))
-        .map_err(|e| Error::Protocol(e.to_string()))?;
-    if genesis.founders.is_empty() {
-        return Err(Error::Protocol("founder manifest is not configured; collect public identities in manager and populate src/founders.json before building the server".into()));
-    }
-    let pin = TrustState::genesis_digest(&genesis)?;
-    TrustState::new(&genesis, &pin)?;
+pub fn parse_genesis(bytes: &[u8]) -> Result<TrustGenesis> {
+    let genesis: TrustGenesis =
+        serde_json::from_slice(bytes).map_err(|e| Error::Protocol(e.to_string()))?;
+    validate_genesis(&genesis)?;
     Ok(genesis)
 }
 
+pub fn validate_genesis(genesis: &TrustGenesis) -> Result<String> {
+    if genesis.founders.is_empty() {
+        return Err(Error::Protocol(
+            "identity genesis must contain at least one founder".into(),
+        ));
+    }
+    let pin = TrustState::genesis_digest(genesis)?;
+    TrustState::new(genesis, &pin)?;
+    Ok(pin)
+}
+
+fn validate_identity_root(config: &Config, genesis: &TrustGenesis) -> Result<()> {
+    let pin = validate_genesis(genesis)?;
+    if let Some(identity) = &config.services.identity
+        && identity.genesis_hash != pin
+    {
+        return Err(Error::Protocol(
+            "identity genesis does not match the supplied trust root".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Standalone deployments cannot replace the compiled root with a configuration file.
-pub fn load(path: &Path) -> Result<Config> {
-    let config = Config::load(path)?;
+pub fn load(path: &Path, genesis: &TrustGenesis) -> Result<Config> {
+    let config = Config::load(path, Some(genesis))?;
     if let Some(identity) = &config.services.identity
         && !identity.genesis.as_os_str().is_empty()
     {
@@ -63,10 +81,11 @@ pub(crate) fn require_private(path: &Path, what: &str) -> anyhow::Result<()> {
 }
 
 /// Explicit local initialization; never replace a lost key or an existing journal.
-pub fn initialize(config: &Config) -> Result<serde_json::Value> {
-    initialize_inner(config).map_err(crate::operation_error)
+pub fn initialize(config: &Config, genesis: &TrustGenesis) -> Result<serde_json::Value> {
+    validate_identity_root(config, genesis)?;
+    initialize_inner(config, genesis).map_err(crate::operation_error)
 }
-fn initialize_inner(config: &Config) -> anyhow::Result<serde_json::Value> {
+fn initialize_inner(config: &Config, genesis: &TrustGenesis) -> anyhow::Result<serde_json::Value> {
     let identity = match std::fs::symlink_metadata(&config.node.key) {
         Ok(_) => Identity::load(&config.node.key)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -91,9 +110,10 @@ fn initialize_inner(config: &Config) -> anyhow::Result<serde_json::Value> {
     let mut output = serde_json::json!({"peer":identity.peer_id().to_string()});
     if let Some(service) = &config.services.identity {
         output["identity"] =
-            serde_json::json!({"genesis":genesis()?,"genesis_hash":service.genesis_hash});
+            serde_json::json!({"genesis":genesis,"genesis_hash":service.genesis_hash});
     }
-    if let Some(governance) = &config.services.governance {
+    let mut pins = Vec::new();
+    for governance in config.services.governance.iter() {
         let binding = governance
             .binding
             .clone()
@@ -115,12 +135,11 @@ fn initialize_inner(config: &Config) -> anyhow::Result<serde_json::Value> {
             !governance.journal.try_exists()?,
             "business journal already exists"
         );
-        let pin = match governance.domain {
-            Domain::Identity => write_business::<state::EmptyDomain>(&governance.genesis, binding)?,
-            Domain::League => write_business::<league::LeagueDomain>(&governance.genesis, binding)?,
-            Domain::Office => write_business::<Office>(&governance.genesis, binding)?,
-        };
-        output["business_genesis"] = pin.into();
+        let pin = write_business::<Application>(&governance.genesis, binding)?;
+        pins.push(pin);
+    }
+    if let Some(pin) = pins.into_iter().next() {
+        output["genesis_hash"] = pin.into();
     }
     Ok(output)
 }
@@ -172,36 +191,61 @@ fn sign_possession(
     client::trust::sign(&mut record, key)?;
     Ok(record)
 }
-fn sign_file(key: &Path, record: &Path, out: &Path, proof: PossessionProof) -> anyhow::Result<()> {
+fn sign_file(
+    key: &Path,
+    genesis: &TrustGenesis,
+    record: &Path,
+    out: &Path,
+    proof: PossessionProof,
+) -> anyhow::Result<()> {
+    validate_genesis(genesis)?;
     anyhow::ensure!(
         record.metadata()?.len() <= node::protocol::MAX_TRUST_RECORD as u64,
         "record too large"
     );
     let signed = sign_possession(
         &Identity::load(key)?,
-        &genesis()?,
+        genesis,
         serde_json::from_slice(&std::fs::read(record)?)?,
         proof,
     )?;
     write_new_inner(out, &signed)
 }
 /// A host signs only its own service registration; chairs still authorize and submit it.
-pub fn sign_service(config: &Config, record: &Path, out: &Path) -> Result<()> {
-    sign_file(&config.node.key, record, out, PossessionProof::Service)
-        .map_err(crate::operation_error)
+pub fn sign_service(
+    config: &Config,
+    genesis: &TrustGenesis,
+    record: &Path,
+    out: &Path,
+) -> Result<()> {
+    validate_identity_root(config, genesis)?;
+    sign_file(
+        &config.node.key,
+        genesis,
+        record,
+        out,
+        PossessionProof::Service,
+    )
+    .map_err(crate::operation_error)
 }
 /// Executors prove possession when being bound; they cannot impersonate a chair or another device.
-pub fn sign_device(key: &Path, record: &Path, out: &Path) -> Result<()> {
-    sign_file(key, record, out, PossessionProof::Device).map_err(crate::operation_error)
+pub fn sign_device(key: &Path, genesis: &TrustGenesis, record: &Path, out: &Path) -> Result<()> {
+    sign_file(key, genesis, record, out, PossessionProof::Device).map_err(crate::operation_error)
 }
 
 /// Public, directly importable client settings. The operator chooses a reachable address;
 /// an identity replica exports its pinned writer endpoint instead of accepting writes locally.
-pub fn identity_config(config: &Config, address: Option<String>) -> Result<serde_json::Value> {
-    identity_config_inner(config, address).map_err(crate::operation_error)
+pub fn identity_config(
+    config: &Config,
+    genesis: &TrustGenesis,
+    address: Option<String>,
+) -> Result<serde_json::Value> {
+    validate_identity_root(config, genesis)?;
+    identity_config_inner(config, genesis, address).map_err(crate::operation_error)
 }
 fn identity_config_inner(
     config: &Config,
+    genesis: &TrustGenesis,
     address: Option<String>,
 ) -> anyhow::Result<serde_json::Value> {
     let service = config
@@ -227,7 +271,7 @@ fn identity_config_inner(
         (peer, parsed.to_string())
     };
     Ok(client::management::review_config(&client::trust::Config {
-        genesis: genesis()?,
+        genesis: genesis.clone(),
         genesis_hash: service.genesis_hash.clone(),
         log: Default::default(),
         address,
@@ -245,14 +289,47 @@ pub fn initialize_device(path: &Path) -> Result<client::management::PublicIdenti
 #[cfg(test)]
 mod tests {
     use super::*;
+    const TEST_ROOT: &[u8] = include_bytes!("../tests/fixtures/founders.json");
     #[test]
-    fn manifest_is_either_unconfigured_or_valid() {
-        let raw: TrustGenesis = serde_json::from_str(include_str!("founders.json")).unwrap();
-        if raw.founders.is_empty() {
-            assert!(genesis().is_err());
-        } else {
-            assert_eq!(genesis().unwrap(), raw);
-        }
+    fn explicit_genesis_requires_a_valid_nonempty_trust_root() {
+        let bytes = TEST_ROOT;
+        let raw: TrustGenesis = serde_json::from_slice(bytes).unwrap();
+        assert!(!raw.founders.is_empty());
+        assert_eq!(parse_genesis(bytes).unwrap(), raw);
+        let mut invalid = raw;
+        invalid.quorum = invalid.founders.len() + 1;
+        assert!(parse_genesis(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        invalid.founders.clear();
+        assert!(parse_genesis(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        assert!(parse_genesis(b"invalid").is_err());
+    }
+    #[test]
+    fn explicit_root_controls_initialization_and_identity_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let genesis = parse_genesis(TEST_ROOT).unwrap();
+        let pin = validate_genesis(&genesis).unwrap();
+        let key = dir.path().join("node.key");
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "node":{"key":key},"services":{"identity":{
+                "genesis_hash":pin,"log":dir.path().join("identity.jsonl"),
+                "writer":true,"max_staleness_seconds":60
+            }}
+        }))
+        .unwrap();
+        let mut other = genesis.clone();
+        other.federation = "different-explicit-test-root".into();
+        assert!(initialize(&config, &other).is_err());
+        assert!(!key.exists());
+        assert!(identity_config(&config, &other, None).is_err());
+        let initialized = initialize(&config, &genesis).unwrap();
+        assert_eq!(
+            initialized["identity"]["genesis"],
+            serde_json::to_value(&genesis).unwrap()
+        );
+        let exported =
+            identity_config(&config, &genesis, Some("/ip4/127.0.0.1/tcp/29637".into())).unwrap();
+        assert_eq!(exported["genesis"], serde_json::to_value(&genesis).unwrap());
+        assert_eq!(exported["genesis_hash"], pin);
     }
     #[test]
     fn initialization_preserves_existing_keys_and_rejects_lost_keys() {
@@ -260,17 +337,18 @@ mod tests {
         let key = dir.path().join("node.key");
         let config: Config =
             serde_json::from_value(serde_json::json!({"node":{"key":key}})).unwrap();
-        let first = initialize(&config).unwrap();
-        assert_eq!(first, initialize(&config).unwrap());
+        let genesis = parse_genesis(TEST_ROOT).unwrap();
+        let first = initialize(&config, &genesis).unwrap();
+        assert_eq!(first, initialize(&config, &genesis).unwrap());
         std::fs::write(&key, b"corrupt").unwrap();
-        assert!(initialize(&config).is_err());
+        assert!(initialize(&config, &genesis).is_err());
         std::fs::remove_file(&key).unwrap();
         let log = dir.path().join("existing.jsonl");
         std::fs::write(&log, b"existing state").unwrap();
         let config: Config = serde_json::from_value(serde_json::json!({"node":{"key":key},"services":{"identity":{
-            "genesis":"unused","genesis_hash":"a".repeat(64),"log":log,"writer":true,"max_staleness_seconds":60
+            "genesis":"unused","genesis_hash":validate_genesis(&genesis).unwrap(),"log":log,"writer":true,"max_staleness_seconds":60
         }}})).unwrap();
-        assert!(initialize(&config).is_err());
+        assert!(initialize(&config, &genesis).is_err());
         assert!(!key.exists());
     }
     #[test]
@@ -317,7 +395,7 @@ mod tests {
             Some("worker")
         );
         let mut registration = state.draft(TrustAction::RegisterService {
-            service: "office".into(),
+            service: "application".into(),
             audience: executor.peer_id().to_string(),
             club: "school".into(),
         });
@@ -337,7 +415,7 @@ mod tests {
         let mut grant = state.draft(TrustAction::GrantPermission {
             id: "p".into(),
             member: "worker".into(),
-            service: "office".into(),
+            service: "application".into(),
             permission: "admin".into(),
         });
         client::trust::sign(&mut grant, &chair).unwrap();
@@ -349,16 +427,16 @@ mod tests {
         let path = dir.path().join("business.json");
         let binding = node::protocol::TrustBusinessBinding {
             genesis: "a".repeat(64),
-            namespace: "office".into(),
-            service: "office".into(),
+            namespace: "application".into(),
+            service: "application".into(),
             club: "school".into(),
             audience: Identity::generate().peer_id().to_string(),
         };
-        let pin = write_business::<Office>(&path, binding.clone()).unwrap();
-        let state: state::State<Office> =
+        let pin = write_business::<Application>(&path, binding.clone()).unwrap();
+        let state: state::State<Application> =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let journal = authority::journal::Journal::open(dir.path().join("journal"), state).unwrap();
         assert_eq!(pin, journal.genesis_hash());
-        assert!(write_business::<Office>(&path, binding).is_err());
+        assert!(write_business::<Application>(&path, binding).is_err());
     }
 }

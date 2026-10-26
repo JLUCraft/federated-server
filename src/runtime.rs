@@ -1,8 +1,9 @@
 //! Unified service assembly. One identity, one Node and one bounded service dispatcher.
-use crate::{office_ai, ops, rooms};
+use crate::{ai_worker, ops, rooms};
 use anyhow::{Context, Result, ensure};
 use authority::authority::Authority;
-use authority::journal::Journal;
+use authority::events::PROTOCOL as EVENTS_PROTOCOL;
+use authority::journal::{Journal, PROTOCOL as GOVERNANCE_PROTOCOL};
 use node::{AccessPolicy, Identity, Node, NodeConfig, PeerId, Service, ServiceId};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -15,8 +16,8 @@ use tokio::{
     task::JoinSet,
 };
 
-pub use crate::office_ai::Config as AiWorkerConfig;
-pub type Office = flows::Flows<events::EventsDomain>;
+pub use crate::ai_worker::Config as AiWorkerConfig;
+pub use client::application::Application;
 const SERVICE_QUEUE: usize = 32;
 const MAX_ROOMS: usize = 8;
 const CONFIG_BYTES: u64 = 1024 * 1024;
@@ -50,16 +51,102 @@ pub struct Services {
     pub league_proxy: Option<LeagueProxy>,
     pub scoring: Option<Scoring>,
     pub directory: bool,
-    pub relay: bool,
+    pub relay: RelayService,
     pub governance: Option<Governance>,
-    pub gateway: Option<Gateway>,
     pub ai_worker: Option<AiWorkerConfig>,
-    pub office_worker: Option<crate::office_workflows::Config>,
-    pub office_push: Option<crate::office_push::Config>,
+    pub activity_oracle: Option<crate::activity::Config>,
+    pub workflow_worker: Option<crate::workflow_worker::Config>,
+    pub notifications: Option<crate::notifications::Config>,
     pub report_board: Option<crate::report_board::Config>,
     pub operations: Option<Operations>,
     pub member_rooms: Vec<rooms::HostConfig>,
     pub documents: Option<Documents>,
+}
+
+/// Relay service toggle: `true`/`false` keeps the default circuit limits, a table overrides them.
+/// Manual deserialization keeps `deny_unknown_fields` on `RelayLimits` effective (untagged enums would ignore it).
+#[derive(Debug)]
+pub enum RelayService {
+    Toggle(bool),
+    Limits(RelayLimits),
+}
+
+impl Default for RelayService {
+    fn default() -> Self {
+        Self::Toggle(false)
+    }
+}
+
+impl<'de> Deserialize<'de> for RelayService {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Bool(enabled) => Ok(Self::Toggle(enabled)),
+            value @ serde_json::Value::Object(_) => RelayLimits::deserialize(value)
+                .map(Self::Limits)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom(
+                "relay must be a boolean or a limits table",
+            )),
+        }
+    }
+}
+
+impl RelayService {
+    fn config(&self) -> Option<node::RelayConfig> {
+        match self {
+            Self::Toggle(true) => Some(node::RelayConfig::default()),
+            Self::Toggle(false) => None,
+            Self::Limits(limits) => Some(limits.config()),
+        }
+    }
+    fn enabled(&self) -> bool {
+        !matches!(self, Self::Toggle(false))
+    }
+}
+
+/// Relay circuit limits; every field falls back to `node::RelayConfig::default()`.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RelayLimits {
+    pub max_reservations: usize,
+    pub max_circuits: usize,
+    pub max_circuit_bytes: u64,
+    pub max_circuit_duration_seconds: u64,
+}
+
+impl Default for RelayLimits {
+    fn default() -> Self {
+        let defaults = node::RelayConfig::default();
+        Self {
+            max_reservations: defaults.max_reservations,
+            max_circuits: defaults.max_circuits,
+            max_circuit_bytes: defaults.max_circuit_bytes,
+            max_circuit_duration_seconds: defaults.max_circuit_duration.as_secs(),
+        }
+    }
+}
+
+impl RelayLimits {
+    fn config(&self) -> node::RelayConfig {
+        node::RelayConfig {
+            max_reservations: self.max_reservations,
+            max_circuits: self.max_circuits,
+            max_circuit_bytes: self.max_circuit_bytes,
+            max_circuit_duration: std::time::Duration::from_secs(self.max_circuit_duration_seconds),
+        }
+    }
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.max_reservations > 0
+                && self.max_circuits > 0
+                && self.max_circuit_bytes > 0
+                && self.max_circuit_duration_seconds > 0,
+            "relay limits must be positive"
+        );
+        Ok(())
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,7 +169,7 @@ pub struct IdentityService {
     #[serde(default)]
     pub genesis_hash: String,
     #[serde(skip)]
-    embedded_genesis: Option<node::protocol::TrustGenesis>,
+    root: Option<node::protocol::TrustGenesis>,
     pub log: PathBuf,
     pub writer: bool,
     pub source: Option<IdentitySource>,
@@ -94,38 +181,23 @@ pub struct IdentitySource {
     pub peer: String,
     pub address: String,
 }
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Domain {
-    Identity,
-    League,
-    Office,
-}
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Governance {
     #[serde(default)]
     pub replication: Option<Replication>,
-    pub domain: Domain,
     pub genesis: PathBuf,
     pub journal: PathBuf,
     #[serde(default)]
     pub binding: Option<node::protocol::TrustBusinessBinding>,
 }
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Replication {
     pub id: u64,
     #[serde(default)]
     pub initialize: bool,
     pub peers: std::collections::BTreeMap<u64, state::governance::ConsensusPeer>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Gateway {
-    pub service: String,
-    pub config: PathBuf,
-    pub ledger: PathBuf,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -153,26 +225,34 @@ fn relative(base: &Path, path: &mut PathBuf) {
     }
 }
 impl Config {
-    pub fn load(path: &Path) -> crate::Result<Self> {
-        Self::load_inner(path).map_err(crate::operation_error)
+    /// Identity services require the caller's root; directory and relay nodes do not.
+    pub fn load(
+        path: &Path,
+        genesis: Option<&node::protocol::TrustGenesis>,
+    ) -> crate::Result<Self> {
+        Self::load_inner(path, genesis).map_err(crate::operation_error)
     }
-    fn load_inner(path: &Path) -> Result<Self> {
+    fn load_inner(path: &Path, genesis: Option<&node::protocol::TrustGenesis>) -> Result<Self> {
         let path = path.canonicalize()?;
         let base = path.parent().context("configuration directory missing")?;
         let mut config: Self = read(&path)?;
         relative(base, &mut config.node.key);
         if let Some(identity) = &mut config.services.identity {
-            if identity.genesis.as_os_str().is_empty() {
-                let genesis = crate::bootstrap::genesis()?;
-                let pin = client::trust::TrustState::genesis_digest(&genesis)?;
-                ensure!(
-                    identity.genesis_hash.is_empty() || identity.genesis_hash == pin,
-                    "identity genesis does not match this server build"
-                );
-                identity.genesis_hash = pin;
-                identity.embedded_genesis = Some(genesis);
-            } else {
+            let genesis = genesis.context("identity service requires an explicit trust root")?;
+            let pin = crate::bootstrap::validate_genesis(genesis)?;
+            ensure!(
+                identity.genesis_hash.is_empty() || identity.genesis_hash == pin,
+                "identity genesis does not match the supplied trust root"
+            );
+            identity.genesis_hash = pin;
+            identity.root = Some(genesis.clone());
+            if !identity.genesis.as_os_str().is_empty() {
                 relative(base, &mut identity.genesis);
+                let configured: node::protocol::TrustGenesis = read(&identity.genesis)?;
+                ensure!(
+                    configured == *genesis,
+                    "identity genesis file does not match the supplied trust root"
+                );
             }
             relative(base, &mut identity.log);
         }
@@ -185,25 +265,36 @@ impl Config {
             relative(base, &mut scoring.key);
             relative(base, &mut scoring.token);
         }
-        if let Some(g) = &mut config.services.governance {
+        if let Some(board) = &mut config.services.report_board {
+            relative(base, &mut board.key);
+        }
+        for g in config.services.governance.iter_mut() {
             relative(base, &mut g.genesis);
             relative(base, &mut g.journal);
         }
-        if let Some(g) = &mut config.services.gateway {
-            relative(base, &mut g.config);
-            relative(base, &mut g.ledger);
-        }
-        if let Some(p) = &mut config.services.office_push {
+        if let Some(p) = &mut config.services.notifications {
             relative(base, &mut p.key);
             relative(base, &mut p.store);
             relative(base, &mut p.vapid_key);
         }
-        if let Some(a) = &mut config.services.office_worker {
+        if let Some(a) = &mut config.services.workflow_worker {
             relative(base, &mut a.key);
-            relative(base, &mut a.identity);
+        }
+        if let Some(oracle) = &mut config.services.activity_oracle {
+            relative(base, &mut oracle.key);
+            relative(base, &mut oracle.spool);
+            relative(base, &mut oracle.evidence_directory);
+            for probe in &mut oracle.probes {
+                relative(base, &mut probe.token);
+            }
         }
         if let Some(a) = &mut config.services.ai_worker {
             relative(base, &mut a.key);
+            for provider in &mut a.providers {
+                if let Some(path) = &mut provider.key_file {
+                    relative(base, path);
+                }
+            }
         }
         if let Some(o) = &mut config.services.operations {
             for instance in &mut o.instances {
@@ -235,7 +326,7 @@ impl Config {
         let mut network = NodeConfig {
             external_addresses: addresses(&self.node.external)?,
             bootstrap: addresses(&self.node.bootstrap)?,
-            relay: self.services.relay.then(node::RelayConfig::default),
+            relay: self.services.relay.config(),
             discovery_server: self.services.directory,
             lan_discovery: self.node.lan_discovery,
             ..Default::default()
@@ -250,8 +341,10 @@ impl Config {
     }
     fn validate_inner(&self) -> Result<()> {
         self.network()?;
+        if let RelayService::Limits(limits) = &self.services.relay {
+            limits.validate()?;
+        }
         let protected = self.services.governance.is_some()
-            || self.services.gateway.is_some()
             || self.services.operations.is_some()
             || self.services.documents.is_some()
             || !self.services.member_rooms.is_empty();
@@ -291,13 +384,8 @@ impl Config {
         );
         if self.services.league_proxy.is_some() || self.services.scoring.is_some() {
             ensure!(
-                self.services.identity.is_some()
-                    && self
-                        .services
-                        .governance
-                        .as_ref()
-                        .is_some_and(|g| matches!(g.domain, Domain::League)),
-                "league adapters require unified league governance"
+                self.services.identity.is_some() && self.services.governance.is_some(),
+                "game adapters require application governance"
             );
         }
         if let Some(scoring) = &self.services.scoring {
@@ -306,8 +394,8 @@ impl Config {
                 "scoring adapter must bind loopback"
             );
         }
-        let needs_governance = self.services.gateway.is_some()
-            || self.services.ai_worker.is_some()
+        let needs_governance = self.services.ai_worker.is_some()
+            || self.services.activity_oracle.is_some()
             || (self.services.identity.is_none()
                 && (self.services.operations.is_some() || self.services.documents.is_some()));
         ensure!(
@@ -316,35 +404,20 @@ impl Config {
         );
         ensure!(
             (self.services.ai_worker.is_none()
-                && self.services.office_worker.is_none()
-                && self.services.office_push.is_none()
+                && self.services.workflow_worker.is_none()
+                && self.services.notifications.is_none()
                 && self.services.report_board.is_none())
-                || self
-                    .services
-                    .governance
-                    .as_ref()
-                    .is_some_and(|g| matches!(g.domain, Domain::Office)),
-            "AI worker requires office governance"
+                || self.services.governance.is_some(),
+            "workflow services require application governance"
         );
         if let Some(worker) = &self.services.ai_worker {
-            let local =
-                worker.address.is_empty() && worker.peer.is_empty() && worker.service.is_empty();
+            ensure!(!worker.providers.is_empty(), "AI worker needs providers");
+        }
+        if let Some(oracle) = &self.services.activity_oracle {
             ensure!(
-                (local && self.services.gateway.is_some())
-                    || (!worker.address.is_empty()
-                        && !worker.peer.is_empty()
-                        && !worker.service.is_empty()),
-                "AI worker needs a local gateway or a complete remote target"
+                oracle.bind.ip().is_loopback(),
+                "activity adapter must bind loopback"
             );
-            if !local {
-                let peer: PeerId = worker.peer.parse()?;
-                let address: node::Multiaddr = worker.address.parse()?;
-                let _: ServiceId = worker.service.parse()?;
-                ensure!(
-                    matches!(address.iter().last(), Some(node::AddressProtocol::P2p(id)) if id == peer),
-                    "AI target address must match peer"
-                );
-            }
         }
         let mut ids = HashSet::new();
         let mut register = |id: &str| -> Result<()> {
@@ -354,16 +427,13 @@ impl Config {
         if let Some(proxy) = &self.services.league_proxy {
             register(&proxy.config.service)?;
         }
-        if let Some(g) = &self.services.gateway {
-            register(&g.service)?;
-        }
         if let Some(o) = &self.services.operations {
             register(&o.service)?;
         }
         if let Some(d) = &self.services.documents {
             register(&d.service)?;
         }
-        if let Some(p) = &self.services.office_push {
+        if let Some(p) = &self.services.notifications {
             register(&p.service)?;
         }
         let mut directories = HashSet::new();
@@ -407,10 +477,12 @@ pub struct Host {
     tasks: JoinSet<Result<()>>,
     routes: HashMap<ServiceId, mpsc::Sender<node::IncomingSession>>,
     rooms: Vec<rooms::LocalRoom>,
+    witnesses: crate::activity::Witnesses,
+    oracle: Option<crate::activity::Oracle>,
     fleet: Option<Arc<ops::Fleet>>,
     services: Vec<String>,
-    pending_ai: Option<(Authority<Office>, AiWorkerConfig)>,
-    pending_office: Option<(Authority<Office>, crate::office_workflows::Config)>,
+    pending_ai: Option<(Authority<Application>, ai_worker::Prepared)>,
+    pending_workflows: Option<(Authority<Application>, crate::workflow_worker::Config)>,
     #[cfg(feature = "server")]
     raft: Vec<authority::consensus::Raft>,
     identity: Option<(
@@ -449,10 +521,12 @@ impl Host {
             tasks: JoinSet::new(),
             routes: HashMap::new(),
             rooms: Vec::new(),
+            witnesses: crate::activity::Witnesses::default(),
+            oracle: None,
             fleet: None,
             services: Vec::new(),
             pending_ai: None,
-            pending_office: None,
+            pending_workflows: None,
             #[cfg(feature = "server")]
             raft: Vec::new(),
             identity: None,
@@ -479,12 +553,12 @@ impl Host {
             }
             anyhow::bail!("node dispatcher stopped")
         });
-        if let Some((authority, config)) = host.pending_office.take() {
+        if let Some((authority, config)) = host.pending_workflows.take() {
             host.tasks
-                .spawn(crate::office_workflows::serve(authority, config));
+                .spawn(crate::workflow_worker::serve(authority, config));
         }
         if let Some((authority, config)) = host.pending_ai.take() {
-            host.tasks.spawn(office_ai::serve(authority, config));
+            host.tasks.spawn(ai_worker::serve(authority, config));
         }
         Ok(host)
     }
@@ -498,9 +572,13 @@ impl Host {
     }
     async fn prepare(&mut self, mut services: Services) -> Result<()> {
         if let Some(config) = services.identity.take() {
-            let genesis = match config.embedded_genesis {
+            let genesis = match config.root {
                 Some(genesis) => genesis,
-                None => read(&config.genesis)?,
+                None => {
+                    let genesis = read(&config.genesis)?;
+                    crate::bootstrap::validate_genesis(&genesis)?;
+                    genesis
+                }
             };
             let log = Arc::new(Mutex::new(authority::trust::TrustLog::open(
                 &config.log,
@@ -561,92 +639,11 @@ impl Host {
         if services.directory {
             self.services.push("directory".into());
         }
-        if services.relay {
+        if services.relay.enabled() {
             self.services.push("relay".into());
         }
-        if let Some(g) = services.governance.take() {
-            match g.domain {
-                Domain::Identity => {
-                    let authority = self.open_authority::<state::EmptyDomain>(&g).await?;
-                    self.governance(authority, &mut services).await?;
-                }
-                Domain::League => {
-                    let authority = self.open_authority::<league::LeagueDomain>(&g).await?;
-                    self.league_adapters(authority.clone(), &mut services)
-                        .await?;
-                    self.governance(authority, &mut services).await?;
-                }
-                Domain::Office => {
-                    let authority = self.open_authority::<Office>(&g).await?;
-                    if let Some(config) = services.report_board.take() {
-                        self.tasks
-                            .spawn(crate::report_board::serve(authority.clone(), config));
-                        self.services.push("report_board".into());
-                    }
-                    if let Some(config) = services.office_push.take() {
-                        let service = config.service.parse()?;
-                        self.node()?
-                            .publish(Service {
-                                id: service,
-                                name: "Office notifications".into(),
-                                protocol: node::protocol::OFFICE_PUSH_PROTOCOL.into(),
-                                metadata: vec![],
-                                access: self.access("use")?,
-                            })
-                            .await?;
-                        let incoming = self.route(service);
-                        self.tasks.spawn(crate::office_push::serve(
-                            authority.clone(),
-                            config,
-                            incoming,
-                        ));
-                        self.services.push("office_push".into());
-                    }
-
-                    if let Some(config) = services.office_worker.take() {
-                        Identity::load(&config.key)?;
-                        self.pending_office = Some((authority.clone(), config));
-                        self.services.push("office_worker".into());
-                    }
-                    if let Some(mut config) = services.ai_worker.take() {
-                        if config.address.is_empty() {
-                            let node = self.node()?;
-                            let address = node
-                                .addresses()
-                                .into_iter()
-                                .find(|a| {
-                                    !a.iter()
-                                        .any(|p| matches!(p, node::AddressProtocol::P2pCircuit))
-                                })
-                                .context("local gateway has no direct listener")?;
-                            let address: node::Multiaddr = address
-                                .iter()
-                                .map(|p| match p {
-                                    node::AddressProtocol::Ip4(ip) if ip.is_unspecified() => {
-                                        node::AddressProtocol::Ip4(std::net::Ipv4Addr::LOCALHOST)
-                                    }
-                                    node::AddressProtocol::Ip6(ip) if ip.is_unspecified() => {
-                                        node::AddressProtocol::Ip6(std::net::Ipv6Addr::LOCALHOST)
-                                    }
-                                    p => p,
-                                })
-                                .collect();
-                            config.address = address.to_string();
-                            config.peer = node.peer_id().to_string();
-                            config.service = services
-                                .gateway
-                                .as_ref()
-                                .context("local gateway missing")?
-                                .service
-                                .clone();
-                        }
-                        Identity::load(&config.key)?;
-                        self.pending_ai = Some((authority.clone(), config));
-                        self.services.push("ai_worker".into());
-                    }
-                    self.governance(authority, &mut services).await?;
-                }
-            }
+        if let Some(governance) = services.governance.take() {
+            self.start_governance(&governance, &mut services).await?;
         }
         self.other_services(&mut services).await?;
         for config in services.member_rooms {
@@ -658,16 +655,24 @@ impl Host {
                 .context("identity missing")?
                 .1
                 .clone();
-            self.rooms
-                .push(rooms::LocalRoom::start(self.node()?, incoming, config, view).await?);
+            self.rooms.push(
+                rooms::LocalRoom::start(
+                    self.node()?,
+                    incoming,
+                    config,
+                    view,
+                    Some(self.witnesses.clone()),
+                )
+                .await?,
+            );
             self.services.push(format!("room:{service}"));
         }
 
         Ok(())
     }
-    async fn league_adapters(
+    async fn game_adapters(
         &mut self,
-        authority: Authority<league::LeagueDomain>,
+        authority: Authority<Application>,
         services: &mut Services,
     ) -> Result<()> {
         if services.league_proxy.is_none() && services.scoring.is_none() {
@@ -700,6 +705,7 @@ impl Host {
                 authority.clone(),
                 key,
                 incoming,
+                Some(self.witnesses.clone()),
             ));
             self.services.push(format!("league_proxy:{id}"));
         }
@@ -778,58 +784,70 @@ impl Host {
         );
         Ok(authority)
     }
-    async fn governance<D: state::Domain>(
-        &mut self,
-        authority: Authority<D>,
-        services: &mut Services,
-    ) -> Result<()> {
+    async fn governance<D: state::Domain>(&mut self, authority: Authority<D>) -> Result<()> {
         let node = self.node()?;
         let serving = authority.clone();
-        self.tasks
-            .spawn(async move { serving.serve(node).await.map_err(Into::into) });
-        let node = self.node()?;
-        let events = authority.clone();
         self.tasks.spawn(async move {
-            authority::events::serve_authority(node, events)
+            serving
+                .serve(node, GOVERNANCE_PROTOCOL)
                 .await
                 .map_err(Into::into)
         });
-        self.services.push("governance".into());
-        if let Some(g) = services.gateway.take() {
-            let service = g.service.parse()?;
-            let club = authority.stored_state().await.core.identity.club.clone();
-            let gateway = llm_gateway::Gateway::new(
-                read(&g.config)?,
-                llm_gateway::Ledger::open(g.ledger)?,
-                authority,
-            )?;
-            let gateway = Arc::new(gateway);
-            let mut access = self.access("use")?;
-            if let AccessPolicy::Trust { requirement, .. } = &mut access {
-                requirement.clubs.insert(club);
-            }
+        let node = self.node()?;
+        let events = authority.clone();
+        self.tasks.spawn(async move {
+            authority::events::serve_authority(node, events, EVENTS_PROTOCOL)
+                .await
+                .map_err(Into::into)
+        });
+        self.services.push("application".into());
+        Ok(())
+    }
+    async fn start_governance(&mut self, g: &Governance, services: &mut Services) -> Result<()> {
+        let authority = self.open_authority::<Application>(g).await?;
+        if let Some(config) = services.activity_oracle.take() {
+            self.oracle = Some(
+                crate::activity::Oracle::start(config, authority.clone(), self.witnesses.clone())
+                    .await?,
+            );
+            self.services.push("activity_oracle".into());
+        }
+        self.game_adapters(authority.clone(), services).await?;
+        if let Some(config) = services.report_board.take() {
+            self.tasks
+                .spawn(crate::report_board::serve(authority.clone(), config));
+            self.services.push("report_board".into());
+        }
+        if let Some(config) = services.notifications.take() {
+            let service = config.service.parse()?;
             self.node()?
                 .publish(Service {
                     id: service,
-                    name: "LLM".into(),
-                    protocol: node::protocol::LLM_PROTOCOL.into(),
+                    name: "Application notifications".into(),
+                    protocol: node::protocol::APPLICATION_PUSH_PROTOCOL.into(),
                     metadata: vec![],
-                    access,
+                    access: self.access("use")?,
                 })
                 .await?;
-            let mut incoming = self.route(service);
-            self.tasks.spawn(async move {
-                let mut tasks = JoinSet::new();
-                loop { tokio::select! {
-                    session = incoming.recv() => { let Some(session) = session else { break; }; let gateway = gateway.clone(); tasks.spawn(async move {gateway.serve(session).await}); }
-                    Some(result) = tasks.join_next(), if !tasks.is_empty() => { if !matches!(result, Ok(Ok(()))) { tracing::debug!("gateway session ended"); } }
-                }}
-                tasks.shutdown().await;
-                Ok(())
-            });
-            self.services.push(format!("gateway:{service}"));
+            let incoming = self.route(service);
+            self.tasks.spawn(crate::notifications::serve(
+                authority.clone(),
+                config,
+                incoming,
+            ));
+            self.services.push("notifications".into());
         }
-        self.other_services(services).await?;
+
+        if let Some(config) = services.workflow_worker.take() {
+            Identity::load(&config.key)?;
+            self.pending_workflows = Some((authority.clone(), config));
+            self.services.push("workflow_worker".into());
+        }
+        if let Some(config) = services.ai_worker.take() {
+            self.pending_ai = Some((authority.clone(), ai_worker::prepare(config)?));
+            self.services.push("ai_worker".into());
+        }
+        self.governance(authority).await?;
         Ok(())
     }
     async fn other_services(&mut self, services: &mut Services) -> Result<()> {
@@ -905,7 +923,12 @@ impl Host {
         })
     }
     pub async fn wait(&mut self) -> crate::Result<()> {
-        match self.tasks.join_next().await {
+        let next = if let Some(oracle) = &self.oracle {
+            tokio::select! {result=self.tasks.join_next()=>result,_=oracle.closed()=>return Err(node::Error::Protocol("activity adapter stopped".into()))}
+        } else {
+            self.tasks.join_next().await
+        };
+        match next {
             Some(Ok(Err(error))) => Err(crate::operation_error(error)),
             Some(Err(error)) => Err(crate::operation_error(error.into())),
             _ => Err(node::Error::Protocol("host service stopped".into())),
@@ -920,6 +943,22 @@ impl Host {
                 node.withdraw(*service).await;
             }
         }
+        let mut error = None;
+        for room in self.rooms.drain(..) {
+            if let Err(e) = room.stop().await {
+                error = Some(anyhow::Error::from(e));
+            }
+        }
+        if let Some(fleet) = self.fleet.take()
+            && let Err(e) = fleet.shutdown().await
+        {
+            error = Some(anyhow::Error::from(e));
+        }
+        if let Some(oracle) = self.oracle.take()
+            && let Err(e) = oracle.stop().await
+        {
+            error = Some(e);
+        }
         #[cfg(feature = "server")]
         for raft in self.raft.drain(..) {
             raft.shutdown().await?;
@@ -927,18 +966,8 @@ impl Host {
         self.tasks.shutdown().await;
         self.routes.clear();
         self.pending_ai.take();
+        self.pending_workflows.take();
         self.identity.take();
-        let mut error = None;
-        for room in self.rooms.drain(..) {
-            if let Err(e) = room.stop().await {
-                error = Some(e);
-            }
-        }
-        if let Some(fleet) = self.fleet.take()
-            && let Err(e) = fleet.shutdown().await
-        {
-            error = Some(e);
-        }
         if let Some(node) = self.node.take() {
             Arc::try_unwrap(node)
                 .map_err(|_| anyhow::anyhow!("node still referenced"))?
@@ -946,7 +975,7 @@ impl Host {
                 .await?;
         }
         if let Some(error) = error {
-            return Err(error.into());
+            return Err(error);
         }
         Ok(())
     }
@@ -960,7 +989,9 @@ impl Drop for Host {
         let mut tasks = std::mem::replace(&mut self.tasks, JoinSet::new());
         let rooms = std::mem::take(&mut self.rooms);
         let fleet = self.fleet.take();
+        let oracle = self.oracle.take();
         self.pending_ai.take();
+        self.pending_workflows.take();
         self.identity.take();
         self.routes.clear();
         #[cfg(feature = "server")]
@@ -968,17 +999,20 @@ impl Drop for Host {
         tasks.abort_all();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                #[cfg(feature = "server")]
-                for raft in raft {
-                    let _ = raft.shutdown().await;
-                }
-                tasks.shutdown().await;
                 for room in rooms {
                     let _ = room.stop().await;
                 }
                 if let Some(fleet) = fleet {
                     let _ = fleet.shutdown().await;
                 }
+                if let Some(oracle) = oracle {
+                    let _ = oracle.stop().await;
+                }
+                #[cfg(feature = "server")]
+                for raft in raft {
+                    let _ = raft.shutdown().await;
+                }
+                tasks.shutdown().await;
                 if let Ok(node) = Arc::try_unwrap(node) {
                     let _ = node.shutdown().await;
                 }

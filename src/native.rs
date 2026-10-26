@@ -2,12 +2,10 @@
 //! encrypted union services; neither a proxy server nor an auth plugin is used.
 use crate::protocol::{self, Fields, Packet};
 use anyhow::{Result, bail, ensure};
+use authority::journal::now_ms;
+use client::application::{Action, Authority};
 use identity::Identity;
-use league::{
-    authority::Authority,
-    governance::{Action, ConnectionHealth, Phase, Route},
-    journal::now_ms,
-};
+use league::governance::{ConnectionHealth, Phase, Route};
 use node::{IncomingSession, Node};
 use serde::Deserialize;
 use std::{
@@ -76,9 +74,10 @@ struct Active {
 }
 struct Runtime {
     journal: Authority,
-    cache: RwLock<league::governance::State>,
+    cache: RwLock<client::application::Snapshot>,
     identity: Identity,
     config: Config,
+    witnesses: Option<crate::activity::Witnesses>,
     healthy: bool,
     active: BTreeMap<String, Active>,
     disconnected: BTreeMap<String, Instant>,
@@ -189,15 +188,12 @@ async fn presence(
     online: bool,
     health: ConnectionHealth,
 ) -> Result<()> {
-    if !online
-        && runtime.cache.read().await.domain.leagues[&runtime.config.league].phase
-            == Phase::Finished
-    {
+    if runtime.cache.read().await.domain.leagues[&runtime.config.league].phase == Phase::Finished {
         return Ok(());
     }
     action(
         runtime,
-        Action::Domain(league::LeagueAction::Presence {
+        client::application::competition(league::LeagueAction::Presence {
             league: runtime.config.league.clone(),
             member: member.into(),
             online,
@@ -269,7 +265,7 @@ async fn monitor(shared: Shared, node: Arc<Node>, changed: watch::Sender<()>) ->
             if paused == healthy {
                 action(
                     &runtime,
-                    Action::Domain(league::LeagueAction::Infrastructure {
+                    client::application::competition(league::LeagueAction::Infrastructure {
                         league: runtime.config.league.clone(),
                         healthy,
                     }),
@@ -280,7 +276,7 @@ async fn monitor(shared: Shared, node: Arc<Node>, changed: watch::Sender<()>) ->
             if healthy && expired {
                 action(
                     &runtime,
-                    Action::Domain(league::LeagueAction::Tick {
+                    client::application::competition(league::LeagueAction::Tick {
                         league: runtime.config.league.clone(),
                     }),
                 )
@@ -349,6 +345,8 @@ async fn session(
         .ok_or_else(|| anyhow::anyhow!("identity required"))?;
     let admission: node::protocol::TrustAdmission = serde_json::from_slice(claims)?;
     let peer = incoming.peer.to_string();
+    let service = incoming.service.to_string();
+    let mut witness: Option<crate::activity::WitnessGuard> = None;
     let mut client = incoming.stream.compat();
     let first = timeout(Duration::from_secs(10), protocol::read_frame(&mut client)).await??;
     let first = Packet::decode(&first, None)?;
@@ -532,6 +530,20 @@ async fn session(
                             let runtime = shared.lock().await;
                             let health = runtime.active[&member].health.clone();
                             presence(&runtime, &member, true, health).await?;
+                            if let Some(witnesses) = &runtime.witnesses {
+                                match witnesses.begin(
+                                    &service,
+                                    &profile.uuid.simple().to_string(),
+                                    &member,
+                                    &peer,
+                                    admission.clubs.clone(),
+                                ) {
+                                    Ok(guard) => witness = Some(guard),
+                                    Err(error) => {
+                                        tracing::warn!(%error,"activity witness unavailable")
+                                    }
+                                }
+                            }
                             announced = true;
                         }
                     }
@@ -553,6 +565,9 @@ async fn session(
                             (active.health.jitter_ms * 3 + active.health.rtt_ms.abs_diff(rtt)) / 4;
                         active.health.rtt_ms = rtt;
                     }
+                }
+                if let Some(witness) = &witness {
+                    witness.touch();
                 }
                 protocol::write_frame(&mut bw, &raw).await?;
             } else {
@@ -612,6 +627,7 @@ pub async fn serve(
     journal: Authority,
     identity: Identity,
     mut incoming: mpsc::Receiver<IncomingSession>,
+    witnesses: Option<crate::activity::Witnesses>,
 ) -> Result<()> {
     {
         let j = journal.operational_state(identity.peer_id()).await?;
@@ -631,6 +647,7 @@ pub async fn serve(
         journal,
         identity,
         config,
+        witnesses,
         healthy: false,
         active: BTreeMap::new(),
         disconnected: BTreeMap::new(),
@@ -638,7 +655,7 @@ pub async fn serve(
     };
     action(
         &runtime,
-        Action::Domain(league::LeagueAction::Infrastructure {
+        client::application::competition(league::LeagueAction::Infrastructure {
             league: runtime.config.league.clone(),
             healthy: false,
         }),
@@ -688,9 +705,10 @@ pub async fn serve_scheduled(
     journal: Authority,
     identity: Identity,
     mut incoming: mpsc::Receiver<IncomingSession>,
+    witnesses: Option<crate::activity::Witnesses>,
 ) -> Result<()> {
     if config.league != "auto" {
-        return serve(config, node, journal, identity, incoming).await;
+        return serve(config, node, journal, identity, incoming, witnesses).await;
     }
     let mut updates = journal.watch().await;
     let mut tasks = JoinSet::new();
@@ -726,6 +744,7 @@ pub async fn serve_scheduled(
                     journal.clone(),
                     identity.clone(),
                     receive,
+                    witnesses.clone(),
                 ));
             }
         }

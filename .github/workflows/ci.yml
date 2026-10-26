@@ -18,6 +18,9 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      # This public test identity establishes test readiness, not production trust approval.
+      FOUNDER_MANIFEST: ${{ github.workspace }}/workspace/federated-server/tests/fixtures/founders.json
     defaults:
       run:
         working-directory: workspace/federated-server
@@ -49,15 +52,6 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
-
-      # src/founders.json is a build input that stays untracked until the
-      # federation settles its founder list (docs/TODO.md); the empty manifest is
-      # a supported build state, so CI does not depend on a local file.
-      - name: Scaffold the founder manifest
-        run: |
-          if [ ! -f src/founders.json ]; then
-            printf '{"federation":"unconfigured","quorum":1,"founders":[]}\n' > src/founders.json
-          fi
 
       # Siblings are checked out at their default branches, so the committed lock
       # file may legitimately need refreshing here; the local check keeps --locked.

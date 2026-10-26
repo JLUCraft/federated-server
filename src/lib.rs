@@ -1,5 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 //! Shared embedded and standalone Minecraft room runtime.
+pub mod activity;
+mod activity_evidence;
 mod bearer;
 pub mod forwarding;
 pub mod native;
@@ -18,13 +20,13 @@ fn operation_error(error: anyhow::Error) -> Error {
     }
 }
 
+mod ai_worker;
 pub mod bootstrap;
 pub mod identity_bridge;
-mod office_ai;
-mod office_push;
-mod office_workflows;
+mod notifications;
 mod report_board;
 pub mod runtime;
+mod workflow_worker;
 
 #[cfg(test)]
 #[path = "../../union-core/tests/support/mod.rs"]

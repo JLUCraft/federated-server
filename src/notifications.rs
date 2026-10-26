@@ -1,5 +1,5 @@
 //! Web Push delivery with encrypted, quorum-replicated subscription checkpoints.
-use crate::runtime::Office;
+use crate::runtime::Application;
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
     aead::{Aead, Payload},
@@ -11,8 +11,8 @@ use identity::Identity;
 use node::{
     IncomingSession,
     protocol::{
-        JsonFrame, OfficePushRequest as Request, OfficePushResponse as Response, read_frame,
-        write_frame,
+        ApplicationPushRequest as Request, ApplicationPushResponse as Response, JsonFrame,
+        read_frame, write_frame,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ struct Store {
     sent: BTreeSet<String>,
 }
 pub async fn serve(
-    a: Authority<Office>,
+    a: Authority<Application>,
     config: Config,
     mut incoming: tokio::sync::mpsc::Receiver<IncomingSession>,
 ) -> Result<()> {
@@ -92,7 +92,7 @@ pub async fn serve(
             .await
             .domain
             .inner
-            .office
+            .organization
             .push_checkpoints
             .contains_key(&group)
     {
@@ -101,7 +101,13 @@ pub async fn serve(
     loop {
         let mut revision;
         let current = a.stored_state().await;
-        if let Some(checkpoint) = current.domain.inner.office.push_checkpoints.get(&group) {
+        if let Some(checkpoint) = current
+            .domain
+            .inner
+            .organization
+            .push_checkpoints
+            .get(&group)
+        {
             {
                 store = decrypt(
                     &cipher,
@@ -166,7 +172,7 @@ pub async fn serve(
         };
         let mut dirty = false;
         let mut active_deliveries = BTreeSet::new();
-        for (id, notice) in &snapshot.domain.inner.office.notices {
+        for (id, notice) in &snapshot.domain.inner.organization.notices {
             let Some(task) = snapshot.domain.inner.tasks.get(&notice.task) else {
                 continue;
             };
@@ -240,7 +246,7 @@ pub async fn serve(
                             &current.core.identity.service,
                             "read",
                         )
-                        || current.domain.inner.office.notices.get(id) != Some(notice)
+                        || current.domain.inner.organization.notices.get(id) != Some(notice)
                         || current.domain.inner.tasks.get(&notice.task) != Some(task)
                         || current
                             .domain
@@ -360,7 +366,7 @@ fn require_private(path: &std::path::Path) -> Result<()> {
     crate::bootstrap::require_private(path, "push secret")
 }
 
-fn checkpoint_aad(state: &state::State<Office>, group: &str, revision: u64) -> Vec<u8> {
+fn checkpoint_aad(state: &state::State<Application>, group: &str, revision: u64) -> Vec<u8> {
     format!(
         "{}:{}:{group}:{revision}",
         state.core.identity.audience, state.core.identity.service
@@ -383,7 +389,7 @@ fn decrypt(cipher: &Aes256Gcm, text: &str, aad: &[u8]) -> Result<Store> {
     Ok(serde_json::from_slice(&plain)?)
 }
 async fn replicate(
-    a: &Authority<Office>,
+    a: &Authority<Application>,
     key: &Identity,
     cipher: &Aes256Gcm,
     group: &str,
@@ -415,13 +421,15 @@ async fn replicate(
     );
     a.apply(
         key,
-        state::governance::Action::Domain(flows::FlowAction::Inner(events::EventAction::Office(
-            events::workflows::OfficeAction::PushCheckpoint {
-                group: group.into(),
-                expected,
-                ciphertext,
-            },
-        ))),
+        state::governance::Action::Domain(flows::FlowAction::Inner(
+            events::EventAction::Organization(
+                events::workflows::OrganizationAction::PushCheckpoint {
+                    group: group.into(),
+                    expected,
+                    ciphertext,
+                },
+            ),
+        )),
     )
     .await?;
     Ok(next)

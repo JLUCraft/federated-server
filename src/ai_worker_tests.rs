@@ -1,7 +1,7 @@
 use super::*;
 use authority::journal::Journal;
 use client::protocol::Privacy;
-use node::{Node, NodeConfig, ServiceId};
+use node::{Node, NodeConfig};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
@@ -11,7 +11,7 @@ use tokio::{
 };
 
 #[tokio::test]
-async fn unified_identity_drives_office_gateway_and_automatic_worker() -> Result<()> {
+async fn unified_identity_drives_local_provider_and_paid_worker() -> Result<()> {
     automatic_flow(false, None).await
 }
 #[cfg(feature = "server")]
@@ -68,7 +68,6 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
         });
         let host_key=Identity::generate();
-        let service=ServiceId::new();
         let identity_genesis=node::protocol::TrustGenesis {federation:"worker-test".into(),quorum:1,founders:vec![node::protocol::TrustFounder {member:"chair".into(),club:"school".into(),public_key:admin.public_key().encode_protobuf()}]};
         let identity_pin=client::trust::TrustState::genesis_digest(&identity_genesis)?;
         {
@@ -77,17 +76,15 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
             for action in [
                 T::ConfirmMember {member:"worker".into(),club:"school".into(),device:Some(worker.peer_id().to_string()),evidence:"manual".into(),verifier:None},
                 T::ConfirmMember {member:"human".into(),club:"school".into(),device:Some(human.peer_id().to_string()),evidence:"manual".into(),verifier:None},
-                T::RegisterService {service:"office".into(),audience:host_key.peer_id().to_string(),club:"school".into()},
-                T::RegisterService {service:service.to_string(),audience:host_key.peer_id().to_string(),club:"school".into()},
-                T::GrantPermission {id:"worker-office".into(),member:"worker".into(),service:"office".into(),permission:"write".into()},
-                T::GrantPermission {id:"human-office".into(),member:"human".into(),service:"office".into(),permission:"admin".into()},
-                T::GrantPermission {id:"worker-gateway".into(),member:"worker".into(),service:service.to_string(),permission:"use".into()},
+                T::RegisterService {service:"application".into(),audience:host_key.peer_id().to_string(),club:"school".into()},
+                T::GrantPermission {id:"worker-office".into(),member:"worker".into(),service:"application".into(),permission:"write".into()},
+                T::GrantPermission {id:"human-office".into(),member:"human".into(),service:"application".into(),permission:"admin".into()},
             ] {
                 let mut record=log.state().draft(action);
                 for key in [&admin,&worker,&human,&host_key] {client::trust::sign(&mut record,key)?;}
                 log.append(record)?;
             }
-            genesis=state::State::<Office>::new(node::protocol::TrustBusinessBinding {genesis:identity_pin.clone(),namespace:"office".into(),service:"office".into(),audience:host_key.peer_id().to_string(),club:"school".into()})?;
+            genesis=state::State::<Application>::new(node::protocol::TrustBusinessBinding {genesis:identity_pin.clone(),namespace:"application".into(),service:"application".into(),audience:host_key.peer_id().to_string(),club:"school".into()})?;
             std::fs::write(dir.path().join("identity-genesis.json"),serde_json::to_vec(&identity_genesis)?)?;
         }
 
@@ -95,9 +92,8 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
         host_key.save_new(dir.path().join("node.key"))?;
         let mut config=serde_json::json!({
             "node":{"key":"node.key"},"services":{
-                "governance":{"domain":"office","genesis":"genesis.json","journal":"office"},
-                "gateway":{"service":service.to_string(),"config":"gateway.json","ledger":"usage"},
-                "ai_worker":{"key":"worker.key"}
+                "governance":{"genesis":"genesis.json","journal":"office"},
+                "ai_worker":{"key":"worker.key","providers":[{"id":"fixture","protocol":"chat_completions","url":url,"models":["local"],"context_tokens":4096}]}
             }
         });
         {
@@ -115,59 +111,79 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
         }
         #[cfg(not(feature = "server"))]
         assert!(!replicated);
+        genesis.domain.ai_pricing.insert("local".into(),flows::ai::AiPricing {base_points:1,input_points_per_1k:1,output_points_per_1k:1,max_input_tokens:1024,settlement:flows::ai::Settlement::Burn});
+        genesis.domain.inner.organization.points.insert("school".into(),[("human".into(),1000)].into());
         std::fs::write(dir.path().join("genesis.json"),serde_json::to_vec(&genesis)?)?;
         let hash=node::protocol::digest(&serde_json::to_vec(&genesis)?);
-        std::fs::write(dir.path().join("gateway.json"),serde_json::to_vec(&serde_json::json!({
-            "providers":[{"url":url,"key_env":null,"sensitive":true,"self_hosted":true,"models":["local"],"context_tokens":128}],
-            "members":{"worker":{"tokens_per_day":1024,"models":["local"]}},"purposes":["events.summary"],
-            "max_tokens":32,"max_messages":2,"max_input_bytes":4096,"concurrency":1
-        }))?)?;
         let config_path=dir.path().join("node.json");
         std::fs::write(&config_path,serde_json::to_vec(&config)?)?;
-        let host=crate::runtime::Host::start(crate::runtime::Config::load(&config_path)?).await?;
+        let host=crate::runtime::Host::start(crate::runtime::Config::load(&config_path,Some(&identity_genesis))?).await?;
         let client_node=Node::start(human.clone(),NodeConfig::default()).await?;
         client_node.dial(host.status()?.addresses[0].parse()?).await?;
         let cache={
             let log=Mutex::new(client::trust::TrustLog::open(&dir.path().join("client.jsonl"),&identity_genesis,&identity_pin)?);
             authority::trust::synchronize(&client_node,host_key.peer_id(),&log).await?;log.into_inner()
         };
-        while client::office::snapshot(&client_node,host_key.peer_id(),&hash).await.is_err() {tokio::time::sleep(std::time::Duration::from_millis(50)).await;}
+        while client::files::snapshot(&client_node,host_key.peer_id(),&hash).await.is_err() {tokio::time::sleep(std::time::Duration::from_millis(50)).await;}
         let install=state::governance::Action::Domain(F::InstallTemplate{id:"summary".into(),template});
         assert!(genesis.clone().apply(&worker.peer_id().to_string(),0,now,install.clone(),cache.state()).is_err());
-        let installed=client::trust::execute::<Office>(&client_node,host_key.peer_id(),&hash,&human,&cache,install).await?;
+        let installed=client::trust::execute::<Application>(&client_node,host_key.peer_id(),&hash,&human,&cache,install,client::journal::PROTOCOL).await?;
         assert!(installed.error.is_none(),"{:?}",installed.error);
-        let input=client::office::upload(&client_node,host_key.peer_id(),&hash,&human,client::office::Upload{branch:"main",path:"notes.txt",message:"meeting input",bytes:b"meeting notes"},&cache).await?;
-        let snapshot=client::office::snapshot(&client_node,host_key.peer_id(),&hash).await?;
-        let mut updates=authority::events::subscribe(&client_node,host_key.peer_id(),snapshot.revision).await?;
+        let roles=client::trust::execute::<Application>(&client_node,host_key.peer_id(),&hash,&human,&cache,state::governance::Action::SetMemberRoles{member:"human".into(),roles:["president".into()].into()},client::journal::PROTOCOL).await?;
+        assert!(roles.error.is_none());
+        let input=client::files::upload(&client_node,host_key.peer_id(),&hash,&human,client::files::Upload{branch:"main",path:"notes.txt",message:"meeting input",bytes:b"meeting notes"},&cache).await?;
+        let snapshot=client::files::snapshot(&client_node,host_key.peer_id(),&hash).await?;
+        let mut updates=authority::events::subscribe(&client_node,host_key.peer_id(),snapshot.revision,authority::events::PROTOCOL).await?;
         let create=events::EventAction::Create{id:"event".into(),title:"meeting".into(),brief_hash:input.to_string(),window:events::Window{opens_ms:now+60000,closes_ms:now+120000,starts_ms:now+180000}};
         let payload=if decision.is_some() {
             for action in [create,events::EventAction::Submit{id:"event".into()}] {
-                let reply=client::trust::execute::<Office>(&client_node,host_key.peer_id(),&hash,&human,&cache,state::governance::Action::Domain(F::Inner(action))).await?;
+                let reply=client::trust::execute::<Application>(&client_node,host_key.peer_id(),&hash,&human,&cache,state::governance::Action::Domain(F::Inner(action)),client::journal::PROTOCOL).await?;
                 assert!(reply.error.is_none());
             }
             events::EventAction::Approve{id:"event".into(),epoch:1,co_organizers:Default::default()}
         } else {create};
-        let action=state::governance::Action::Domain(F::Start{id:"flow".into(),template:"summary".into(),input:Some(input.clone()),payload});
-        let reply=client::trust::execute::<Office>(&client_node,host_key.peer_id(),&hash,&human,&cache,action).await?;
+        let action=state::governance::Action::Domain(F::Start{ max_points: 1_000_000,id:"flow".into(),template:"summary".into(),input:Some(input.clone()),payload});
+        let reply=client::trust::execute::<Application>(&client_node,host_key.peer_id(),&hash,&human,&cache,action,client::journal::PROTOCOL).await?;
         assert!(reply.error.is_none(),"{:?}",reply.error);
-        let state=loop {
-            let snapshot=client::office::snapshot(&client_node,host_key.peer_id(),&hash).await?;
+        let mut state=loop {
+            let snapshot=client::files::snapshot(&client_node,host_key.peer_id(),&hash).await?;
             let flow=&snapshot.domain.flows["flow"];
-            let expected=match decision {Some("reject" | "timeout")=>flows::Status::Rejected,Some("changes_requested")=>flows::Status::ChangesRequested,Some("invalid")=>flows::Status::Active,_=>flows::Status::Approved};
+            let expected=match decision {Some("reject" | "timeout")=>flows::Status::Rejected,Some("changes_requested")=>flows::Status::ChangesRequested,Some("invalid" | "approve")=>flows::Status::Active,_=>flows::Status::Approved};
             if flow.status==expected && flow.records[0].ai_runs.last().is_some_and(|r|r.output.is_some() || r.error.is_some()) {break snapshot;}
             authority::events::next(&mut updates).await?;
         };
         let run=&state.domain.flows["flow"].records[0].ai_runs[0];
+        assert_eq!(state.domain.flows["flow"].records[0].escrowed_points,0);
+        assert_eq!(state.domain.inner.organization.points["school"]["human"],if matches!(decision,Some("invalid"|"timeout")) {1000} else {998});
+
         if matches!(decision,Some("invalid" | "timeout")) {assert!(run.output.is_none());assert!(run.error.is_some());}
         else if decision.is_some() {assert!(run.review.is_some());}
         else {assert_eq!(state.domain.inner.files.read(run.output.as_ref().unwrap())?,b"summary result");}
+        if decision==Some("approve") {
+            let flow=&state.domain.flows["flow"];
+            assert_eq!(flow.current,1);
+            assert_eq!(state.domain.inner.events["event"].phase,events::Phase::Review);
+            assert!(flow.deadline_ms.is_none());
+            assert!(matches!(flows::template_for(&state.domain.flow_templates,flow)?.stages[1].approver,flows::Approver::ClubPresidents{..}));
+            let worker_node=Node::start(worker.clone(),NodeConfig::default()).await?;
+            worker_node.dial(host.status()?.addresses[0].parse()?).await?;
+            let denied=client::trust::execute::<Application>(&worker_node,host_key.peer_id(),&hash,&worker,&cache,state::governance::Action::Domain(F::Approve{instance:"flow".into(),comment_hash:"a".repeat(64)}),client::journal::PROTOCOL).await?;
+            assert!(denied.error.is_some());
+            worker_node.shutdown().await?;
+            for action in [F::Approve{instance:"flow".into(),comment_hash:"a".repeat(64)},F::Execute{instance:"flow".into()}] {
+                let reply=client::trust::execute::<Application>(&client_node,host_key.peer_id(),&hash,&human,&cache,state::governance::Action::Domain(action),client::journal::PROTOCOL).await?;
+                assert!(reply.error.is_none(),"{:?}",reply.error);
+            }
+            state=client::files::snapshot(&client_node,host_key.peer_id(),&hash).await?;
+            assert_eq!(state.domain.inner.events["event"].phase,events::Phase::Approved);
+        }
         assert_eq!(calls.load(Ordering::SeqCst),1);
         provider.await?;
         drop(updates);
         client_node.shutdown().await?;
         host.close().await?;
         if !replicated {
-            let replay=Journal::<Office>::open(dir.path().join("office"),genesis.clone())?;
+            let replay=Journal::<Application>::open(dir.path().join("office"),genesis.clone())?;
             assert_eq!(replay.state(),&state);
         }
         #[cfg(feature = "server")]

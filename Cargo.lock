@@ -719,6 +719,7 @@ dependencies = [
  "events",
  "flows",
  "identity",
+ "league",
  "node",
  "protocol",
  "serde",
@@ -1347,6 +1348,7 @@ dependencies = [
 name = "events"
 version = "0.1.0"
 dependencies = [
+ "league",
  "node",
  "protocol",
  "serde",
@@ -2475,7 +2477,6 @@ dependencies = [
 name = "league"
 version = "0.2.0"
 dependencies = [
- "authority",
  "identity",
  "protocol",
  "serde",
@@ -3005,17 +3006,11 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 name = "llm-gateway"
 version = "0.1.0"
 dependencies = [
- "authority",
- "client",
  "futures",
- "identity",
- "node",
  "protocol",
  "reqwest",
  "serde",
  "serde_json",
- "state",
- "tempfile",
  "thiserror 2.0.21",
  "tokio",
 ]

@@ -64,7 +64,7 @@ async fn managed_room_publishes_after_readiness_and_withdraws_on_stop() -> Resul
             },
             club:"a".into(),join_clubs:["a".into()].into(),
         };
-        let room = LocalRoom::start(host.clone(), incoming, config, view).await?;
+        let room = LocalRoom::start(host.clone(), incoming, config, view, None).await?;
         assert_eq!(room.status().context("missing status")?.metadata.players_max, 12);
         assert_eq!(client.list_services(peer).await?.len(), 1);
         room.stop().await?;
@@ -128,6 +128,7 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
         let relay = Node::start(
             Identity::generate(),
             NodeConfig {
+                listen: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse()?],
                 relay: Some(RelayConfig::default()),
                 ..Default::default()
             },
@@ -192,7 +193,9 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             let backend = listener.local_addr()?;
             let key = secret.clone();
             let bridge =
-                tokio::spawn(async move { super::bridge(session, backend, &key, None).await });
+                tokio::spawn(
+                    async move { super::bridge(session, backend, &key, None, None).await },
+                );
             let mut stream = stream.compat();
             let (handshake, login) = login(uuid::Uuid::from_u128(to as u128 + 1))?;
             protocol::write_frame(&mut stream, &handshake).await?;
@@ -205,6 +208,7 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             );
         }
         // Complete the actual Paper forwarding handshake over the relay in both directions.
+        let witnesses = crate::activity::Witnesses::default();
         for (from, to) in [(0, 1), (1, 0)] {
             let stream = peers[from]
                 .open_service(peers[to].peer_id(), services[to])
@@ -216,8 +220,10 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let backend = listener.local_addr()?;
             let key = secret.clone();
-            let bridge =
-                tokio::spawn(async move { super::bridge(session, backend, &key, None).await });
+            let collector = witnesses.clone();
+            let bridge = tokio::spawn(async move {
+                super::bridge(session, backend, &key, None, Some(collector)).await
+            });
             let mut stream = stream.compat();
             let profile = uuid::Uuid::from_u128(from as u128 + 1);
             let (handshake, login) = login(profile)?;
@@ -244,6 +250,11 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             assert_eq!(protocol::read_frame(&mut stream).await?, success);
             drop((remote, stream));
             bridge.await??;
+            assert!(witnesses.recorded(
+                &services[to].to_string(),
+                &format!("person-{from}"),
+                &profile.simple().to_string()
+            ));
         }
         let ops = ServiceId::new();
         peers[1]

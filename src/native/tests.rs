@@ -1,6 +1,7 @@
 use super::*;
+use authority::journal::Journal;
 use hmac::{Hmac, KeyInit, Mac};
-use league::{governance::Rules, journal::Journal};
+use league::governance::Rules;
 use node::{AccessPolicy, NodeConfig, Service, ServiceId};
 use sha2::Sha256;
 use tokio::net::TcpListener;
@@ -242,7 +243,7 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         for (signer, action) in [
             (
                 &admin,
-                Action::Domain(league::LeagueAction::CreateLeague {
+                client::application::competition(league::LeagueAction::CreateLeague {
                     league: "cup".into(),
                     rules: Rules {
                         seats: 1,
@@ -256,14 +257,14 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
             ),
             (
                 &users[0],
-                Action::Domain(league::LeagueAction::CreateTeam {
+                client::application::competition(league::LeagueAction::CreateTeam {
                     league: "cup".into(),
                     team: "a".into(),
                 }),
             ),
             (
                 &users[0],
-                Action::Domain(league::LeagueAction::Invite {
+                client::application::competition(league::LeagueAction::Invite {
                     league: "cup".into(),
                     team: "a".into(),
                     member: "bob".into(),
@@ -271,14 +272,14 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
             ),
             (
                 &users[1],
-                Action::Domain(league::LeagueAction::Accept {
+                client::application::competition(league::LeagueAction::Accept {
                     league: "cup".into(),
                     team: "a".into(),
                 }),
             ),
             (
                 &users[0],
-                Action::Domain(league::LeagueAction::Register {
+                client::application::competition(league::LeagueAction::Register {
                     league: "cup".into(),
                     team: "a".into(),
                 }),
@@ -326,12 +327,14 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         };
         let incoming = gateway.take_incoming()?;
         let gateway = Arc::new(gateway);
+        let witnesses = crate::activity::Witnesses::default();
         let native = tokio::spawn(serve(
             config,
             gateway.clone(),
             authority.clone(),
             admin.clone(),
             incoming,
+            Some(witnesses.clone()),
         ));
         let clients = [
             Node::start(users[0].clone(), NodeConfig::default()).await?,
@@ -365,10 +368,17 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
                 .len(),
             2
         );
+        for (index, profile) in profiles.iter().enumerate() {
+            assert!(witnesses.recorded(
+                &service.to_string(),
+                members[index],
+                &profile.uuid.simple().to_string()
+            ));
+        }
         authority
             .apply(
                 &admin,
-                Action::Domain(league::LeagueAction::Start {
+                client::application::competition(league::LeagueAction::Start {
                     league: "cup".into(),
                     seed: [0; 32],
                 }),
@@ -415,6 +425,28 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
                 Route::Waiting
             );
         }
+        authority
+            .apply(
+                &admin,
+                client::application::competition(league::LeagueAction::Finish {
+                    league: "cup".into(),
+                }),
+            )
+            .await?;
+        transfer(&mut replacement).await?;
+        let mut finished: Connection = Box::new(
+            clients[standby]
+                .open_service(gateway.peer_id(), service)
+                .await?
+                .compat(),
+        );
+        login(&mut finished, &profiles[standby]).await?;
+        // The competition route closes at finish; the gateway still admits the waiting backend.
+        assert_eq!(
+            journal.lock().await.state().domain.leagues["cup"].route(members[standby]),
+            Route::Unavailable
+        );
+        drop(finished);
         drop(returned);
         drop(replacement);
         drop(streams);
